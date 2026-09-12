@@ -482,7 +482,7 @@ describe('web robot URL authoring', () => {
 				maxPages: 10_000,
 				maxItems: 100_000,
 				maxRequests: 50_000,
-				maxDurationMs: 60 * 60_000,
+				maxDurationMs: 4 * 60 * 60_000,
 				maxResponseBytes: 50 * 1024 * 1024,
 			},
 			respectRobotsTxt: false,
@@ -513,11 +513,142 @@ describe('web robot URL authoring', () => {
 		expect(sanitized.allowedHosts).toEqual(['example.com']);
 		expect(sanitized.respectRobotsTxt).toBe(false);
 		expect(sanitized.request).toMatchObject({ concurrency: 1, delayMs: 500, retries: 2 });
-		expect(sanitized.limits.maxPages).toBe(100);
+		expect(sanitized.limits.maxPages).toBe(5_000);
+		expect(sanitized.limits.maxItems).toBe(50_000);
+		expect(sanitized.limits.maxRequests).toBe(25_000);
+		expect(sanitized.limits.maxDurationMs).toBe(2 * 60 * 60_000);
 		expect(source?.type === 'browser' ? source.headers : undefined).toEqual({});
 		expect(source?.type === 'browser' ? source.actions : []).toEqual([
 			{ type: 'waitForSelector', selector: '.product' },
 		]);
+	});
+
+	it('sizes generated limits from declared catalogue volume', async () => {
+		mocks.discoverWebRobotSource.mockResolvedValue({
+			...discovery,
+			detailCandidates: [
+				{
+					url: 'https://example.com/products/one',
+					loader: 'http' as const,
+					hasJsonLdProduct: true,
+					score: 40,
+				},
+			],
+			paginationCandidates: [
+				{
+					type: 'page' as const,
+					pageVariable: 'page',
+					totalPagesPath: 'numberOfPages',
+					totalItemsPath: 'totalNumberOfResults',
+					declaredPages: 77,
+					declaredItems: 766,
+				},
+			],
+		});
+
+		const result = await authorWebRobotRecipeFromUrl({
+			projectId: 'project-id',
+			url: discovery.url,
+			env: {},
+		});
+
+		expect(result.status).toBe('ready');
+		if (result.status !== 'ready') {
+			return;
+		}
+		const parsed = webRobotRecipeSchema.parse(result.recipe);
+		expect(parsed.stages).toHaveLength(2);
+		expect(parsed.limits.maxPages).toBe(1_054);
+		expect(parsed.limits.maxRequests).toBe(1_054);
+		expect(parsed.limits.maxItems).toBe(2_000);
+		expect(parsed.limits.maxDurationMs).toBeGreaterThan(15 * 60_000);
+		expect(parsed.stages[0]?.paginate).toMatchObject({ type: 'page', maxPages: 100 });
+	});
+
+	it('scales listing pagination bounds and limits for larger declared catalogues', async () => {
+		mocks.discoverWebRobotSource.mockResolvedValue({
+			...discovery,
+			paginationCandidates: [
+				{
+					type: 'page' as const,
+					pageVariable: 'page',
+					totalPagesPath: 'numberOfPages',
+					totalItemsPath: 'totalNumberOfResults',
+					declaredPages: 400,
+					declaredItems: 2_000,
+				},
+			],
+		});
+
+		const result = await authorWebRobotRecipeFromUrl({
+			projectId: 'project-id',
+			url: discovery.url,
+			env: {},
+		});
+
+		expect(result.status).toBe('ready');
+		if (result.status !== 'ready') {
+			return;
+		}
+		const parsed = webRobotRecipeSchema.parse(result.recipe);
+		expect(parsed.stages[0]?.paginate).toMatchObject({ type: 'page', maxPages: 500 });
+		expect(parsed.limits.maxPages).toBe(500);
+		expect(parsed.limits.maxItems).toBe(2_500);
+	});
+
+	it('derives listing pages from a declared item total and observed page size', async () => {
+		mocks.discoverWebRobotSource.mockResolvedValue({
+			...discovery,
+			paginationCandidates: [
+				{
+					type: 'page' as const,
+					pageVariable: 'page',
+					totalItemsPath: 'totalNumberOfResults',
+					declaredItems: 4_000,
+				},
+			],
+		});
+
+		const result = await authorWebRobotRecipeFromUrl({
+			projectId: 'project-id',
+			url: discovery.url,
+			env: {},
+		});
+
+		expect(result.status).toBe('ready');
+		if (result.status !== 'ready') {
+			return;
+		}
+		const parsed = webRobotRecipeSchema.parse(result.recipe);
+		expect(parsed.stages[0]?.paginate).toMatchObject({ type: 'page', maxPages: 1_668 });
+		expect(parsed.limits.maxPages).toBe(1_668);
+		expect(parsed.limits.maxItems).toBe(5_000);
+	});
+
+	it('emits default limits when no totals are declared', async () => {
+		mocks.discoverWebRobotSource.mockResolvedValue({
+			...discovery,
+			paginationCandidates: [{ type: 'page' as const, pageVariable: 'page', totalPagesPath: 'totalPages' }],
+		});
+
+		const result = await authorWebRobotRecipeFromUrl({
+			projectId: 'project-id',
+			url: discovery.url,
+			env: {},
+		});
+
+		expect(result.status).toBe('ready');
+		if (result.status !== 'ready') {
+			return;
+		}
+		const parsed = webRobotRecipeSchema.parse(result.recipe);
+		expect(parsed.limits).toMatchObject({
+			maxPages: 100,
+			maxItems: 2_000,
+			maxRequests: 1_000,
+			maxDurationMs: 15 * 60_000,
+		});
+		expect(parsed.stages[0]?.paginate).toMatchObject({ type: 'page', maxPages: 100 });
 	});
 
 	it('summarizes repair changes and only repairs from static catalogue URLs', () => {

@@ -46,6 +46,7 @@ export const generateDeterministicCandidates = (discovery: WebRobotSourceDiscove
 		const pagination = paginationFor(
 			discovery.paginationCandidates,
 			candidate.loader === 'browser' ? ['nextLink', 'click', 'scroll'] : ['nextLink'],
+			candidate.itemCount,
 		);
 		const hasDetail = candidate.fields.url && bestDetail(discovery) !== undefined;
 		if (pagination) {
@@ -82,10 +83,10 @@ export const sanitizeAuthoredRecipe = (recipe: WebRobotRecipe, discovery: WebRob
 			userAgent: recipe.request.userAgent,
 		},
 		limits: {
-			maxPages: Math.min(recipe.limits.maxPages, 100),
-			maxItems: Math.min(recipe.limits.maxItems, 2_000),
-			maxRequests: Math.min(recipe.limits.maxRequests, 1_000),
-			maxDurationMs: Math.min(recipe.limits.maxDurationMs, 15 * 60_000),
+			maxPages: Math.min(recipe.limits.maxPages, LIMITS_CEILING.maxPages),
+			maxItems: Math.min(recipe.limits.maxItems, LIMITS_CEILING.maxItems),
+			maxRequests: Math.min(recipe.limits.maxRequests, LIMITS_CEILING.maxRequests),
+			maxDurationMs: Math.min(recipe.limits.maxDurationMs, LIMITS_CEILING.maxDurationMs),
 			maxResponseBytes: Math.min(recipe.limits.maxResponseBytes, 5 * 1024 * 1024),
 		},
 		publish: {
@@ -98,7 +99,12 @@ export const sanitizeAuthoredRecipe = (recipe: WebRobotRecipe, discovery: WebRob
 
 const apiRecipe = (discovery: WebRobotSourceDiscovery, candidate: WebRobotApiCandidate): Record<string, unknown> => {
 	const detail = candidate.fields.url ? bestDetail(discovery) : undefined;
-	const paginate = paginationFor(discovery.paginationCandidates, ['nextPath', 'cursor', 'offset', 'page']);
+	const pagination = paginationFor(
+		discovery.paginationCandidates,
+		['nextPath', 'cursor', 'offset', 'page'],
+		candidate.itemCount,
+	);
+	const paginate = pagination?.paginate;
 	const method = candidate.method === 'POST' ? 'POST' : 'GET';
 	const listing = listingStage(
 		'products',
@@ -119,7 +125,11 @@ const apiRecipe = (discovery: WebRobotSourceDiscovery, candidate: WebRobotApiCan
 		paginate,
 		!detail,
 	);
-	return recipe(discovery, candidate, detail ? [listing, detailStage(detail)] : [listing]);
+	return recipe(discovery, candidate, detail ? [listing, detailStage(detail)] : [listing], {
+		pagination: pagination?.candidate,
+		itemCount: candidate.itemCount,
+		hasDetail: detail !== undefined,
+	});
 };
 
 const networkRecipe = (
@@ -127,7 +137,12 @@ const networkRecipe = (
 	candidate: WebRobotApiCandidate,
 ): Record<string, unknown> => {
 	const detail = candidate.fields.url ? bestDetail(discovery) : undefined;
-	const paginate = paginationFor(discovery.paginationCandidates, ['nextLink', 'click', 'scroll']);
+	const pagination = paginationFor(
+		discovery.paginationCandidates,
+		['nextLink', 'click', 'scroll'],
+		candidate.itemCount,
+	);
+	const paginate = pagination?.paginate;
 	const listing = listingStage(
 		'products',
 		{
@@ -147,7 +162,11 @@ const networkRecipe = (
 		paginate,
 		!detail,
 	);
-	return recipe(discovery, candidate, detail ? [listing, detailStage(detail)] : [listing]);
+	return recipe(discovery, candidate, detail ? [listing, detailStage(detail)] : [listing], {
+		pagination: pagination?.candidate,
+		itemCount: candidate.itemCount,
+		hasDetail: detail !== undefined,
+	});
 };
 
 const domRecipe = (
@@ -156,13 +175,15 @@ const domRecipe = (
 	options: { details?: boolean; pagination?: boolean } = {},
 ): Record<string, unknown> => {
 	const detail = options.details !== false && candidate.fields.url ? bestDetail(discovery) : undefined;
-	const paginate =
+	const pagination =
 		options.pagination === false
 			? undefined
 			: paginationFor(
 					discovery.paginationCandidates,
 					candidate.loader === 'browser' ? ['nextLink', 'click', 'scroll'] : ['nextLink'],
+					candidate.itemCount,
 				);
+	const paginate = pagination?.paginate;
 	const source =
 		candidate.loader === 'browser'
 			? {
@@ -191,6 +212,7 @@ const domRecipe = (
 		discovery,
 		{ fields: {}, identityField: undefined },
 		detail ? [listing, detailStage(detail)] : [listing],
+		{ pagination: pagination?.candidate, itemCount: candidate.itemCount, hasDetail: detail !== undefined },
 	);
 };
 
@@ -208,10 +230,12 @@ const jsonLdRecipe = (
 				}
 			: candidate.fields;
 	const detail = candidate.schemaType !== 'Product' && fields.url ? bestDetail(discovery) : undefined;
-	const paginate = paginationFor(
+	const pagination = paginationFor(
 		discovery.paginationCandidates,
 		candidate.loader === 'browser' ? ['nextLink', 'click', 'scroll'] : ['nextLink'],
+		candidate.itemCount,
 	);
+	const paginate = pagination?.paginate;
 	const source =
 		candidate.loader === 'browser'
 			? {
@@ -234,6 +258,7 @@ const jsonLdRecipe = (
 		discovery,
 		{ fields, identityField: fields.sku?.path },
 		detail ? [listing, detailStage(detail)] : [listing],
+		{ pagination: pagination?.candidate, itemCount: candidate.itemCount, hasDetail: detail !== undefined },
 	);
 };
 
@@ -242,10 +267,12 @@ const embeddedRecipe = (
 	candidate: WebRobotEmbeddedCandidate,
 ): Record<string, unknown> => {
 	const detail = candidate.fields.url ? bestDetail(discovery) : undefined;
-	const paginate = paginationFor(
+	const pagination = paginationFor(
 		discovery.paginationCandidates,
 		candidate.loader === 'browser' ? ['nextLink', 'click', 'scroll'] : ['nextLink'],
+		candidate.itemCount,
 	);
+	const paginate = pagination?.paginate;
 	const source =
 		candidate.loader === 'browser'
 			? {
@@ -275,6 +302,7 @@ const embeddedRecipe = (
 		discovery,
 		{ fields: candidate.fields, identityField: candidate.fields.sku?.path },
 		detail ? [listing, detailStage(detail)] : [listing],
+		{ pagination: pagination?.candidate, itemCount: candidate.itemCount, hasDetail: detail !== undefined },
 	);
 };
 
@@ -282,28 +310,88 @@ const recipe = (
 	discovery: WebRobotSourceDiscovery,
 	candidate: Pick<WebRobotApiCandidate, 'fields'> & { identityField?: string },
 	stages: Record<string, unknown>[],
+	volume: RecipeVolume,
 ): Record<string, unknown> => ({
 	version: 2,
 	allowedHosts: discovery.allowedHosts,
 	request: {
 		concurrency: 1,
-		delayMs: 500,
+		delayMs: GENERATED_DELAY_MS,
 		timeoutMs: 20_000,
 		retries: 2,
 		userAgent: 'nao-web-robot/1.0',
 	},
-	limits: {
-		maxPages: 100,
-		maxItems: 2_000,
-		maxRequests: 1_000,
-		maxDurationMs: 15 * 60_000,
-		maxResponseBytes: 5 * 1024 * 1024,
-	},
+	limits: sizedLimits(volume),
 	publish: { minItems: 1, maxRemovedPercent: 50 },
 	identity: { strategy: 'first_present', fields: identityFields(candidate) },
 	respectRobotsTxt: false,
 	stages,
 });
+
+type RecipeVolume = {
+	pagination?: WebRobotPaginationCandidate;
+	itemCount?: number;
+	hasDetail: boolean;
+};
+
+const GENERATED_DELAY_MS = 500;
+const LIMIT_HEADROOM = 1.25;
+const FETCH_TIME_ALLOWANCE_MS = 2_000;
+const LIMITS_FLOOR = {
+	maxPages: 100,
+	maxItems: 2_000,
+	maxRequests: 1_000,
+	maxDurationMs: 15 * 60_000,
+} as const;
+const LIMITS_CEILING = {
+	maxPages: 5_000,
+	maxItems: 50_000,
+	maxRequests: 25_000,
+	maxDurationMs: 2 * 60 * 60_000,
+} as const;
+
+const clampLimit = (value: number, floor: number, ceiling: number): number => Math.min(ceiling, Math.max(floor, value));
+
+const declaredListingPages = (
+	candidate: WebRobotPaginationCandidate | undefined,
+	itemCount?: number,
+): number | undefined => {
+	if (candidate?.type === 'page') {
+		if (candidate.declaredPages !== undefined) {
+			return candidate.declaredPages;
+		}
+		if (candidate.declaredItems !== undefined && itemCount !== undefined && itemCount > 0) {
+			return Math.max(1, Math.ceil(candidate.declaredItems / itemCount));
+		}
+		return undefined;
+	}
+	if (candidate?.type === 'offset' && candidate.declaredItems !== undefined) {
+		return Math.max(1, Math.ceil(candidate.declaredItems / candidate.pageSize));
+	}
+	return undefined;
+};
+
+const declaredItemTotal = (candidate: WebRobotPaginationCandidate | undefined): number | undefined =>
+	candidate?.type === 'page' || candidate?.type === 'offset' ? candidate.declaredItems : undefined;
+
+const sizedPaginateMaxPages = (listingPages?: number): number =>
+	clampLimit(Math.ceil((listingPages ?? 0) * LIMIT_HEADROOM), LIMITS_FLOOR.maxPages, LIMITS_CEILING.maxPages);
+
+const sizedLimits = (volume: RecipeVolume): WebRobotRecipe['limits'] => {
+	const listingPages = declaredListingPages(volume.pagination, volume.itemCount) ?? 1;
+	const expectedItems =
+		declaredItemTotal(volume.pagination) ?? (volume.itemCount !== undefined ? volume.itemCount * listingPages : 0);
+	const fetches = listingPages + (volume.hasDetail ? expectedItems : 0);
+	const fetchBudget = Math.ceil(fetches * LIMIT_HEADROOM);
+	const duration = Math.ceil(fetches * (GENERATED_DELAY_MS + FETCH_TIME_ALLOWANCE_MS) * LIMIT_HEADROOM);
+	return {
+		maxPages: clampLimit(fetchBudget, LIMITS_FLOOR.maxPages, LIMITS_CEILING.maxPages),
+		maxItems: clampLimit(Math.ceil(expectedItems * LIMIT_HEADROOM), LIMITS_FLOOR.maxItems, LIMITS_CEILING.maxItems),
+		maxRequests: clampLimit(fetchBudget, LIMITS_FLOOR.maxRequests, LIMITS_CEILING.maxRequests),
+		maxDurationMs: clampLimit(duration, LIMITS_FLOOR.maxDurationMs, LIMITS_CEILING.maxDurationMs),
+		maxResponseBytes: 5 * 1024 * 1024,
+	};
+};
 
 const listingStage = (
 	id: string,
@@ -572,21 +660,28 @@ const parseJsonQueryValue = (value: string): unknown => {
 const paginationFor = (
 	candidates: WebRobotPaginationCandidate[],
 	types: WebRobotPaginationCandidate['type'][],
-): Record<string, unknown> | undefined => {
+	itemCount?: number,
+): { paginate: Record<string, unknown>; candidate: WebRobotPaginationCandidate } | undefined => {
 	const allowed = candidates.filter((candidate) => types.includes(candidate.type));
 	const nextPath = allowed.find((candidate) => candidate.type === 'nextPath');
 	if (nextPath) {
-		return { type: 'nextPath', path: nextPath.path, maxPages: 100 };
+		return {
+			paginate: { type: 'nextPath', path: nextPath.path, maxPages: LIMITS_FLOOR.maxPages },
+			candidate: nextPath,
+		};
 	}
 	const nextLink = allowed.find((candidate) => candidate.type === 'nextLink');
 	if (nextLink) {
 		return {
-			type: 'nextLink',
-			selector: nextLink.selector,
-			...(nextLink.selectors ? { selectors: nextLink.selectors } : {}),
-			...(nextLink.fingerprint ? { fingerprint: nextLink.fingerprint } : {}),
-			attr: nextLink.attr,
-			maxPages: 100,
+			paginate: {
+				type: 'nextLink',
+				selector: nextLink.selector,
+				...(nextLink.selectors ? { selectors: nextLink.selectors } : {}),
+				...(nextLink.fingerprint ? { fingerprint: nextLink.fingerprint } : {}),
+				attr: nextLink.attr,
+				maxPages: LIMITS_FLOOR.maxPages,
+			},
+			candidate: nextLink,
 		};
 	}
 	const click = allowed.find(
@@ -595,12 +690,15 @@ const paginationFor = (
 	);
 	if (click) {
 		return {
-			type: 'click',
-			selector: click.selector,
-			...(click.selectors ? { selectors: click.selectors } : {}),
-			...(click.fingerprint ? { fingerprint: click.fingerprint } : {}),
-			waitMs: click.waitMs ?? 1_000,
-			maxPages: 100,
+			paginate: {
+				type: 'click',
+				selector: click.selector,
+				...(click.selectors ? { selectors: click.selectors } : {}),
+				...(click.fingerprint ? { fingerprint: click.fingerprint } : {}),
+				waitMs: click.waitMs ?? 1_000,
+				maxPages: LIMITS_FLOOR.maxPages,
+			},
+			candidate: click,
 		};
 	}
 	const scroll = allowed.find(
@@ -608,38 +706,50 @@ const paginationFor = (
 			candidate.type === 'scroll' && candidate.observed === true,
 	);
 	if (scroll) {
-		return { type: 'scroll', waitMs: scroll.waitMs ?? 1_000, maxPages: 100 };
+		return {
+			paginate: { type: 'scroll', waitMs: scroll.waitMs ?? 1_000, maxPages: LIMITS_FLOOR.maxPages },
+			candidate: scroll,
+		};
 	}
 	const cursor = allowed.find((candidate) => candidate.type === 'cursor');
 	if (cursor) {
 		return {
-			type: 'cursor',
-			cursorVariable: cursor.cursorVariable,
-			...(cursor.firstCursor !== undefined ? { firstCursor: cursor.firstCursor } : {}),
-			nextCursorPath: cursor.nextCursorPath,
-			maxPages: 100,
+			paginate: {
+				type: 'cursor',
+				cursorVariable: cursor.cursorVariable,
+				...(cursor.firstCursor !== undefined ? { firstCursor: cursor.firstCursor } : {}),
+				nextCursorPath: cursor.nextCursorPath,
+				maxPages: LIMITS_FLOOR.maxPages,
+			},
+			candidate: cursor,
 		};
 	}
 	const offset = allowed.find((candidate) => candidate.type === 'offset');
 	if (offset) {
 		return {
-			type: 'offset',
-			offsetVariable: offset.offsetVariable,
-			firstOffset: offset.firstOffset,
-			pageSize: offset.pageSize,
-			...(offset.totalPath ? { totalPath: offset.totalPath } : {}),
-			maxPages: 100,
+			paginate: {
+				type: 'offset',
+				offsetVariable: offset.offsetVariable,
+				firstOffset: offset.firstOffset,
+				pageSize: offset.pageSize,
+				...(offset.totalPath ? { totalPath: offset.totalPath } : {}),
+				maxPages: sizedPaginateMaxPages(declaredListingPages(offset, itemCount)),
+			},
+			candidate: offset,
 		};
 	}
 	const page = allowed.find((candidate) => candidate.type === 'page');
 	if (page) {
 		return {
-			type: 'page',
-			pageVariable: page.pageVariable,
-			firstPage: 1,
-			...(page.totalPagesPath ? { totalPagesPath: page.totalPagesPath } : {}),
-			...(page.totalItemsPath ? { totalItemsPath: page.totalItemsPath } : {}),
-			maxPages: 100,
+			paginate: {
+				type: 'page',
+				pageVariable: page.pageVariable,
+				firstPage: 1,
+				...(page.totalPagesPath ? { totalPagesPath: page.totalPagesPath } : {}),
+				...(page.totalItemsPath ? { totalItemsPath: page.totalItemsPath } : {}),
+				maxPages: sizedPaginateMaxPages(declaredListingPages(page, itemCount)),
+			},
+			candidate: page,
 		};
 	}
 	return undefined;

@@ -281,6 +281,162 @@ describe('catalogue trust reconciliation', () => {
 		expect(report.summary.entityCount).toBe(2);
 	});
 
+	it('publishes a gap fully explained by the declared item total and gap capacity', () => {
+		const report = reconcile({
+			result: result({
+				countSignals: [countSignal({ id: 'runtime-traversal-products-total', value: 3, source: 'api' })],
+				anomalies: [
+					{
+						code: 'traversal_gap',
+						severity: 'blocking',
+						summary: 'Enumeration target page 2 failed and was recorded as a gap.',
+						traversalId: 'traversal-products',
+						evidenceIds: [],
+						details: {
+							sequence: 1,
+							redactedTarget: 'GET https://example.com/catalog?page=2',
+							error: 'HTTP 500',
+							capacity: 1,
+						},
+					},
+				],
+			}),
+		});
+		expect(report.summary.status).toBe('ready');
+		expect(report.summary.basis).toBe('count_reconciled');
+		expect(report.summary.dimensions.records.status).toBe('passed');
+		expect(report.countComparisons[0]?.status).toBe('reconciled');
+		expect(report.countComparisons[0]?.expectedCount).toBe(3);
+		const gap = report.anomalies.find((entry) => entry.code === 'traversal_gap');
+		expect(gap?.severity).toBe('limitation');
+		expect(report.summary.limitations.some((entry) => entry.includes('page=2'))).toBe(true);
+		expect(report.summary.limitations.some((entry) => entry.includes('1 of 3'))).toBe(true);
+		expect(report.summary.blockerCodes).toEqual([]);
+	});
+
+	it('keeps blocking when the missing count exceeds the gap capacity', () => {
+		const report = reconcile({
+			result: result({
+				countSignals: [countSignal({ id: 'runtime-traversal-products-total', value: 5, source: 'api' })],
+				anomalies: [
+					{
+						code: 'traversal_gap',
+						severity: 'blocking',
+						summary: 'Enumeration target page 2 failed and was recorded as a gap.',
+						traversalId: 'traversal-products',
+						evidenceIds: [],
+						details: {
+							sequence: 1,
+							redactedTarget: 'GET https://example.com/catalog?page=2',
+							error: 'HTTP 500',
+							capacity: 1,
+						},
+					},
+				],
+			}),
+		});
+		expect(report.summary.status).toBe('needs_attention');
+		expect(report.countComparisons[0]?.status).toBe('mismatch');
+		expect(report.summary.blockerCodes).toContain('count_conflict');
+		expect(report.summary.blockerCodes).toContain('traversal_gap');
+	});
+
+	it('keeps a gap blocking when no declared item total exists', () => {
+		const report = reconcile({
+			result: result({
+				anomalies: [
+					{
+						code: 'traversal_gap',
+						severity: 'blocking',
+						summary: 'Enumeration target page 2 failed and was recorded as a gap.',
+						traversalId: 'traversal-products',
+						evidenceIds: [],
+						details: {
+							sequence: 1,
+							redactedTarget: 'GET https://example.com/catalog?page=2',
+							error: 'HTTP 500',
+							capacity: 10,
+						},
+					},
+				],
+			}),
+		});
+		expect(report.summary.status).toBe('needs_attention');
+		expect(report.summary.blockerCodes).toContain('traversal_gap');
+	});
+
+	it('keeps gaps blocking when gap bounds were exceeded even with a declared total', () => {
+		const report = reconcile({
+			result: result({
+				countSignals: [countSignal({ id: 'runtime-traversal-products-total', value: 3, source: 'api' })],
+				traversals: [
+					traversalReport({
+						attempts: [{ ...completeAttempt(), status: 'failed' }],
+						selectedAttemptId: undefined,
+					}),
+				],
+				anomalies: [
+					{
+						code: 'traversal_gap',
+						severity: 'blocking',
+						summary: 'Enumeration target page 2 failed and was recorded as a gap.',
+						traversalId: 'traversal-products',
+						evidenceIds: [],
+						details: {
+							sequence: 1,
+							redactedTarget: 'GET https://example.com/catalog?page=2',
+							error: 'HTTP 500',
+							capacity: 10,
+						},
+					},
+					{
+						code: 'gap_tolerance_exceeded',
+						severity: 'blocking',
+						summary: 'Enumeration stopped: gap tolerance exceeded.',
+						traversalId: 'traversal-products',
+						evidenceIds: [],
+						details: {},
+					},
+				],
+			}),
+		});
+		expect(report.summary.status).toBe('needs_attention');
+		expect(report.summary.blockerCodes).toContain('traversal_gap');
+		expect(report.summary.blockerCodes).toContain('gap_tolerance_exceeded');
+	});
+
+	it('publishes a declared-766 catalogue when one 10-product page failed to load', () => {
+		const products = Array.from({ length: 756 }, (_, index) => product(`SKU-${index}`));
+		const report = reconcile({
+			result: result({
+				products: normalized(products).products,
+				normalized: normalized(products),
+				countSignals: [countSignal({ id: 'runtime-traversal-products-total', value: 766, source: 'api' })],
+				anomalies: [
+					{
+						code: 'traversal_gap',
+						severity: 'blocking',
+						summary: 'Enumeration target page 22 failed and was recorded as a gap.',
+						traversalId: 'traversal-products',
+						evidenceIds: [],
+						details: {
+							sequence: 21,
+							redactedTarget: 'GET https://example.com/api/products?page=22',
+							error: 'HTTP 500 after retries',
+							capacity: 10,
+						},
+					},
+				],
+			}),
+		});
+		expect(report.summary.status).toBe('ready');
+		expect(report.summary.basis).toBe('count_reconciled');
+		expect(report.summary.entityCount).toBe(756);
+		expect(report.countComparisons[0]?.status).toBe('reconciled');
+		expect(report.summary.limitations.some((entry) => entry.includes('page=22'))).toBe(true);
+		expect(report.anomalies.find((entry) => entry.code === 'traversal_gap')?.severity).toBe('limitation');
+	});
+
 	it('blocks when the selected candidate does not match the confirmed scope', () => {
 		const report = reconcile({ sourceAssessment: [decision({ relation: 'subset' })] });
 		expect(report.summary.dimensions.scope.status).toBe('failed');

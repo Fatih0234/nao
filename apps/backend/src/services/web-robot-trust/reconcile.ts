@@ -143,18 +143,8 @@ export const reconcileCatalogueTrust = (
 		}
 		return entry;
 	});
-	const traversalBlockers = normalizedResultAnomalies.filter((entry) => entry.severity === 'blocking');
-	if (traversalBlockers.length > 0) {
-		recordStatus = 'failed';
-		recordReasons.push(
-			`Blocking traversal anomalies: ${[...new Set(traversalBlockers.map((entry) => entry.code))].sort().join(', ')}.`,
-		);
-	}
-	if (recordStatus === 'passed') {
-		recordReasons.push(`All required traversals completed with ${entityCount} unique entities.`);
-	}
-
 	const countComparisons: CountComparison[] = [];
+	const reconciledGaps = new Set<CatalogueAnomaly>();
 	const compatible = result.countSignals.filter(
 		(signal) => signal.scopeId === scope.id && signal.comparable && signal.unit === contract.entityGranularity,
 	);
@@ -189,17 +179,33 @@ export const reconcileCatalogueTrust = (
 		recordReasons.push('Comparable count signals disagree.');
 	} else if (expectedValues.size === 1) {
 		const expected = compatible[0]?.value ?? 0;
+		const missing = expected - entityCount;
+		const gapVerdict = explainMissingWithGaps(normalizedResultAnomalies, result, missing);
+		const gapExplained = gapVerdict.explained;
+		if (gapExplained) {
+			for (const entry of gapVerdict.gaps) {
+				reconciledGaps.add(entry);
+			}
+			limitations.push(
+				missing > 0
+					? `${missing} of ${expected} declared entities could not be collected; enumeration gap(s) at: ${gapTargetList(gapVerdict.gaps)}.`
+					: `Enumeration gap(s) at ${gapTargetList(gapVerdict.gaps)} were reconciled against the declared total of ${expected}.`,
+			);
+		}
+		const status = missing === 0 ? 'match' : gapExplained ? 'reconciled' : 'mismatch';
 		countComparisons.push({
-			status: expected === entityCount ? 'match' : 'mismatch',
+			status,
 			signalIds: compatible.map((signal) => signal.id),
 			observedUniqueCount: entityCount,
 			expectedCount: expected,
 			explanation:
-				expected === entityCount
+				status === 'match'
 					? `Unique entity count ${entityCount} matches the expected total.`
-					: `Unique entity count ${entityCount} does not match the expected total ${expected}.`,
+					: status === 'reconciled'
+						? `Unique entity count ${entityCount} reconciled with expected total ${expected}; ${missing} missing entities are within declared gap capacity.`
+						: `Unique entity count ${entityCount} does not match the expected total ${expected}.`,
 		});
-		if (expected !== entityCount) {
+		if (status === 'mismatch') {
 			anomalies.push(
 				anomaly(
 					'count_conflict',
@@ -215,6 +221,19 @@ export const reconcileCatalogueTrust = (
 		}
 	} else {
 		limitations.push('No independent comparable source count was available.');
+	}
+
+	const traversalBlockers = normalizedResultAnomalies.filter(
+		(entry) => entry.severity === 'blocking' && !reconciledGaps.has(entry),
+	);
+	if (traversalBlockers.length > 0) {
+		recordStatus = 'failed';
+		recordReasons.push(
+			`Blocking traversal anomalies: ${[...new Set(traversalBlockers.map((entry) => entry.code))].sort().join(', ')}.`,
+		);
+	}
+	if (recordStatus === 'passed') {
+		recordReasons.push(`All required traversals completed with ${entityCount} unique entities.`);
 	}
 
 	const identityReasons: string[] = [];
@@ -301,7 +320,12 @@ export const reconcileCatalogueTrust = (
 		freshness: dimension('passed', [`Verified at ${verifiedAt}.`]),
 	};
 
-	const mergedAnomalies = dedupeAnomalies([...normalizedResultAnomalies, ...anomalies]);
+	const mergedAnomalies = dedupeAnomalies([
+		...normalizedResultAnomalies.map((entry) =>
+			reconciledGaps.has(entry) ? { ...entry, severity: 'limitation' as const } : entry,
+		),
+		...anomalies,
+	]);
 
 	const summary = deriveCatalogueTrustVerdict(
 		{
@@ -344,6 +368,42 @@ export const reconcileCatalogueTrust = (
 		anomalies: mergedAnomalies,
 		summary,
 	});
+};
+
+const explainMissingWithGaps = (
+	anomalies: CatalogueAnomaly[],
+	result: WebRobotVerificationExecutionResult,
+	missing: number,
+): { explained: boolean; gaps: CatalogueAnomaly[] } => {
+	const gaps = anomalies.filter((entry) => entry.code === 'traversal_gap' && entry.severity === 'blocking');
+	const totalCapacity = gaps.reduce((total, entry) => total + (gapCapacity(entry) ?? 0), 0);
+	const explained =
+		missing >= 0 &&
+		gaps.length > 0 &&
+		gaps.every((entry) => traversalCompleted(result, entry)) &&
+		(missing === 0 || (gaps.every((entry) => gapCapacity(entry) !== undefined) && missing <= totalCapacity));
+	return { explained, gaps };
+};
+
+const gapTargetList = (gaps: CatalogueAnomaly[]): string =>
+	gaps
+		.map((entry) =>
+			typeof entry.details.redactedTarget === 'string'
+				? entry.details.redactedTarget.slice(0, 200)
+				: `sequence ${String(entry.details.sequence ?? '?')}`,
+		)
+		.slice(0, 8)
+		.join('; ');
+
+const gapCapacity = (entry: CatalogueAnomaly): number | undefined => {
+	const capacity = entry.details.capacity;
+	return typeof capacity === 'number' && Number.isInteger(capacity) && capacity >= 0 ? capacity : undefined;
+};
+
+const traversalCompleted = (result: WebRobotVerificationExecutionResult, entry: CatalogueAnomaly): boolean => {
+	const report = result.traversals.find((candidate) => candidate.definition.id === entry.traversalId);
+	const selected = report?.attempts.find((attempt) => attempt.attemptId === report.selectedAttemptId);
+	return selected?.status === 'complete';
 };
 
 const dedupeAnomalies = (anomalies: CatalogueAnomaly[]): CatalogueAnomaly[] => {

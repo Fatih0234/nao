@@ -197,7 +197,7 @@ export const countSignalSchema = z.object({
 });
 
 export const countComparisonSchema = z.object({
-	status: z.enum(['match', 'mismatch', 'not_comparable']),
+	status: z.enum(['match', 'mismatch', 'not_comparable', 'reconciled']),
 	signalIds: z.array(idSchema).min(1).max(32),
 	observedUniqueCount: nonnegativeIntSchema,
 	expectedCount: nonnegativeIntSchema.optional(),

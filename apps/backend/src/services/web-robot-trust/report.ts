@@ -23,9 +23,11 @@ export const catalogueTrustReadme = (report: CatalogueTrustReport, paths: string
 		);
 	}
 	lines.push('', '## Count evidence');
-	const matches = report.countComparisons.filter((comparison) => comparison.status === 'match');
-	if (matches.length > 0) {
-		for (const comparison of matches) {
+	const positive = (comparison: (typeof report.countComparisons)[number]) =>
+		comparison.status === 'match' || comparison.status === 'reconciled';
+	const reconciled = report.countComparisons.filter(positive);
+	if (reconciled.length > 0) {
+		for (const comparison of reconciled) {
 			lines.push(
 				`- Observed ${comparison.observedUniqueCount} unique entities reconciled with expected count ${comparison.expectedCount ?? 'unknown'}.`,
 			);
@@ -35,7 +37,7 @@ export const catalogueTrustReadme = (report: CatalogueTrustReport, paths: string
 	} else {
 		lines.push('- Count reconciliation did not pass; review the comparison evidence and blockers below.');
 	}
-	for (const comparison of report.countComparisons.filter((entry) => entry.status !== 'match')) {
+	for (const comparison of report.countComparisons.filter((entry) => !positive(entry))) {
 		lines.push(`- ${comparison.status}: ${comparison.explanation ?? 'no explanation'}`);
 	}
 	lines.push('', '## Required concept coverage');

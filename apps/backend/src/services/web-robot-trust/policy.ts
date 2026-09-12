@@ -58,7 +58,7 @@ export const deriveCatalogueTrustVerdict = (
 	if (status === 'ready') {
 		const reconciled = input.countComparisons.some(
 			(comparison) =>
-				comparison.status === 'match' &&
+				(comparison.status === 'match' || comparison.status === 'reconciled') &&
 				comparison.signalIds.some((id) =>
 					input.countSignals.some(
 						(signal) =>

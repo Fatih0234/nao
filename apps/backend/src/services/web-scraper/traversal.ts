@@ -288,6 +288,8 @@ const runListingTraversal = async (
 				sequence: step.sequence,
 				redactedTarget: step.target.redactedTarget,
 				error: error.slice(0, 1024),
+				mode: pagination.type,
+				capacity: pagination.type === 'offset' ? pagination.pageSize : (firstPageSize ?? 0),
 			},
 		});
 		finishStep(step, 'gap', error);

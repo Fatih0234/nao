@@ -1158,6 +1158,7 @@ describe('web robot verification traversal', () => {
 		const gap = result.anomalies.find((anomaly) => anomaly.code === 'traversal_gap');
 		expect(gap).toMatchObject({ severity: 'blocking', traversalId: 'traversal-products' });
 		expect(String(gap?.details.redactedTarget)).toContain('page=2');
+		expect(gap?.details).toMatchObject({ mode: 'page', capacity: 1 });
 		expect(result.products.map((product) => product.sku)).toEqual(['SKU-1', 'SKU-3']);
 	});
 
@@ -1197,7 +1198,8 @@ describe('web robot verification traversal', () => {
 		expect(result.traversals[0]?.attempts[0]?.summary.terminalEvidence?.kind).toBe('short_final_page');
 		expect(result.traversalSteps.map((step) => step.status)).toEqual(['complete', 'gap', 'complete']);
 		expect(result.traversalSteps[1]?.target.redactedTarget).toContain('offset=2');
-		expect(result.anomalies.some((anomaly) => anomaly.code === 'traversal_gap')).toBe(true);
+		const gap = result.anomalies.find((anomaly) => anomaly.code === 'traversal_gap');
+		expect(gap?.details).toMatchObject({ mode: 'offset', capacity: 2 });
 		expect(result.products.map((product) => product.sku)).toEqual(['SKU-0', 'SKU-1', 'SKU-4']);
 	});
 
