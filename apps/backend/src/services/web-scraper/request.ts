@@ -1,4 +1,78 @@
+import type { WebRobotSource } from '@nao/shared/web-robot';
+
+import { renderTemplate, type TemplateScope } from './template';
 import type { HeaderValues } from './types';
+import { canonicalHttpUrl } from './url-policy';
+
+export type RenderedHttpRequest = {
+	source: Extract<WebRobotSource, { type: 'http' | 'api' }>;
+	url: URL;
+	method: string;
+	headers: HeaderValues;
+	body?: BodyInit;
+	bodyValue?: unknown;
+};
+
+export const renderHttpRequest = (
+	source: Extract<WebRobotSource, { type: 'http' | 'api' }>,
+	scope: TemplateScope,
+	env: Record<string, string>,
+): RenderedHttpRequest => {
+	const rendered = renderTemplate(source, scope);
+	const url = buildRequestUrl(rendered);
+	const headers = resolveHeaders(rendered.headers, env);
+	const bodyValue = rendered.body;
+	const body = requestBody(rendered);
+	if (isJsonBody(bodyValue) && !hasHeader(headers, 'content-type')) {
+		headers['content-type'] = 'application/json';
+	}
+	return { source: rendered, url, method: rendered.method, headers, body, bodyValue };
+};
+
+const buildRequestUrl = (source: Extract<WebRobotSource, { type: 'http' | 'api' }>): URL => {
+	const url = new URL(canonicalHttpUrl(source.url));
+	if (source.type !== 'api') {
+		return url;
+	}
+
+	for (const [key, value] of Object.entries(source.query)) {
+		if (value === undefined || value === null) {
+			continue;
+		}
+		if (Array.isArray(value)) {
+			for (const entry of value) {
+				url.searchParams.append(key, String(entry));
+			}
+			continue;
+		}
+		url.searchParams.set(key, typeof value === 'object' ? JSON.stringify(value) : String(value));
+	}
+
+	return url;
+};
+
+const isJsonBody = (body: unknown): boolean => {
+	return (
+		body !== undefined &&
+		body !== null &&
+		typeof body === 'object' &&
+		!(body instanceof FormData) &&
+		!(body instanceof URLSearchParams)
+	);
+};
+
+const hasHeader = (headers: HeaderValues, name: string): boolean => {
+	return Object.keys(headers).some((header) => header.toLowerCase() === name);
+};
+
+const requestBody = (source: Extract<WebRobotSource, { type: 'http' | 'api' }>): BodyInit | undefined => {
+	if (source.body === undefined || source.body === null || source.method === 'GET') {
+		return undefined;
+	}
+	return typeof source.body === 'string' || source.body instanceof FormData || source.body instanceof URLSearchParams
+		? source.body
+		: JSON.stringify(source.body);
+};
 
 export const SENSITIVE_HEADERS = new Set([
 	'authorization',

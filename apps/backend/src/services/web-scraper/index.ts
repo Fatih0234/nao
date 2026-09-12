@@ -5,6 +5,13 @@ export { inspectWebRobotUrl } from './inspect';
 export type { NormalizedProducts, ProductAttributeRow, ProductDocumentRow } from './records';
 export { normalizeProducts } from './records';
 export { runWebRobotRecipe } from './runner';
+export { runWebRobotVerification } from './traversal';
+export type {
+	WebRobotRequestAttempt,
+	WebRobotTraversalReport,
+	WebRobotVerificationExecutionResult,
+	WebRobotVerificationOptions,
+} from './types';
 export type {
 	WebRobotCapturedResponse,
 	WebRobotExecutionOptions,

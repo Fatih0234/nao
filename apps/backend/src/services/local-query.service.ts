@@ -24,7 +24,7 @@ import { getQueryResult } from './query-result.service';
 import { isStorageEnabled, relativePathFromKey, STORAGE_DISABLED_MESSAGE } from './storage';
 import type { StorageFileAccess } from './storage/file-access';
 import { openStorageFiles } from './storage/file-access';
-import { openProjectDatasetFiles } from './storage/project-datasets';
+import { openPublishedProjectDatasetFiles } from './storage/project-datasets';
 import { assertWithinStorageSizeLimit, writeUserFileFromDisk } from './storage/user-files';
 
 export interface LocalQueryOutcome {
@@ -153,7 +153,8 @@ async function openStorageFilesFor(
 		storagePaths.length > 0 ? await openStorageFiles(toStorageScope(context), storagePaths) : null;
 	let datasetAccess: StorageFileAccess | null = null;
 	try {
-		datasetAccess = datasetPaths.length > 0 ? await openProjectDatasetFiles(context.projectId, datasetPaths) : null;
+		datasetAccess =
+			datasetPaths.length > 0 ? await openPublishedProjectDatasetFiles(context.projectId, datasetPaths) : null;
 	} catch (error) {
 		await storageAccess?.release();
 		throw error;

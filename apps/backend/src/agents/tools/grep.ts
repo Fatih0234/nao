@@ -5,7 +5,11 @@ import path from 'path';
 
 import { GrepOutput, renderToModelOutput } from '../../components/tool-outputs';
 import { isStorageEnabled } from '../../services/storage';
-import { canGrepProjectDatasets, grepRootForProjectDatasets } from '../../services/storage/project-datasets';
+import {
+	canGrepProjectDatasets,
+	grepRootForProjectDatasets,
+	publishedProjectDatasetLocations,
+} from '../../services/storage/project-datasets';
 import { canGrepUserFiles, grepRootForUser } from '../../services/storage/user-files';
 import type { ToolContext } from '../../types/tools';
 import { getRipgrepPath } from '../../utils/ripgrep';
@@ -53,7 +57,7 @@ export default createTool<grep.Input, grep.Output>({
 	outputSchema: grep.OutputSchema,
 	execute: async ({ max_results = 100, ...options }, context) => {
 		const rgPath = await getRipgrepPath();
-		const targets = resolveTargets(options.path, context);
+		const targets = await resolveTargets(options.path, context);
 
 		const results = await Promise.all(
 			targets.map((target) => searchTarget(rgPath, target, { ...options, max_results })),
@@ -74,19 +78,19 @@ export default createTool<grep.Input, grep.Output>({
 });
 
 /** A search without a path covers the whole tree, permanent storage included. */
-const resolveTargets = (searchPath: string | undefined, context: ToolContext): SearchTarget[] => {
+const resolveTargets = async (searchPath: string | undefined, context: ToolContext): Promise<SearchTarget[]> => {
 	if (isStoragePath(searchPath)) {
 		return [storageTarget(searchPath!, context)];
 	}
 	if (isDatasetPath(searchPath)) {
-		return [datasetTarget(searchPath!, context)];
+		return datasetTargets(searchPath!, context);
 	}
 	if (searchPath) {
 		return [projectTarget(searchPath, context.projectFolder)];
 	}
 
 	const storage = isStorageEnabled() && canGrepUserFiles() ? [storageTarget(toStorageVirtualPath(''), context)] : [];
-	const datasets = canGrepProjectDatasets() ? [datasetTarget(toDatasetVirtualPath(''), context)] : [];
+	const datasets = canGrepProjectDatasets() ? await datasetTargets(toDatasetVirtualPath(''), context) : [];
 	return [projectTarget(undefined, context.projectFolder), ...storage, ...datasets];
 };
 
@@ -122,11 +126,12 @@ const storageTarget = (searchPath: string, context: ToolContext): SearchTarget =
 	};
 };
 
-const datasetTarget = (searchPath: string, context: ToolContext): SearchTarget => {
+const datasetTargets = async (searchPath: string, context: ToolContext): Promise<SearchTarget[]> => {
 	const spaceRoot = grepRootForProjectDatasets(context.projectId);
+	const locations = await publishedProjectDatasetLocations(context.projectId, toDatasetRelativePath(searchPath));
 
-	return {
-		root: grepRootForProjectDatasets(context.projectId, toDatasetRelativePath(searchPath)),
+	return locations.map(({ requestedRelativePath, storageRelativePath }) => ({
+		root: grepRootForProjectDatasets(context.projectId, storageRelativePath),
 		cwd: spaceRoot,
 		ignoreGlobs: [],
 		includeHidden: true,
@@ -135,11 +140,29 @@ const datasetTarget = (searchPath: string, context: ToolContext): SearchTarget =
 			if (relativePath === '' || relativePath === '..' || relativePath.startsWith(`..${path.sep}`)) {
 				return null;
 			}
-			return toDatasetVirtualPath(relativePath.replaceAll(path.sep, '/'));
+			const physical = relativePath.replaceAll(path.sep, '/');
+			const virtual =
+				physical === storageRelativePath
+					? requestedRelativePath
+					: physical.startsWith(`${storageRelativePath}/`)
+						? `${requestedRelativePath}${physical.slice(storageRelativePath.length)}`
+						: null;
+			return virtual === null ? null : toDatasetVirtualPath(virtual);
 		},
-		toAbsolutePath: (displayPath) =>
-			grepRootForProjectDatasets(context.projectId, toDatasetRelativePath(displayPath)),
-	};
+		toAbsolutePath: (displayPath) => {
+			const relative = toDatasetRelativePath(displayPath);
+			const physical =
+				relative === requestedRelativePath
+					? storageRelativePath
+					: relative.startsWith(`${requestedRelativePath}/`)
+						? `${storageRelativePath}${relative.slice(requestedRelativePath.length)}`
+						: null;
+			if (physical === null) {
+				throw new Error(`Search scope '${displayPath}' is not a trusted published dataset.`);
+			}
+			return grepRootForProjectDatasets(context.projectId, physical);
+		},
+	}));
 };
 
 function searchTarget(

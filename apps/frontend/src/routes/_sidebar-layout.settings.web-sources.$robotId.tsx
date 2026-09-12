@@ -5,8 +5,17 @@ import { useState } from 'react';
 
 import type { WebRobotRun } from '@/components/settings/web-source-recipe';
 import { WebSourceForm } from '@/components/settings/web-source-form';
-import { formatDateTime, isActiveWebRobotRun, recipeSummary } from '@/components/settings/web-source-recipe';
+import {
+	catalogueExecutionLabel,
+	catalogueGranularityLabel,
+	catalogueTrustPresentation,
+	formatDateTime,
+	isActiveWebRobotRun,
+	webSourcePrimaryActionLabel,
+} from '@/components/settings/web-source-recipe';
+import { WebSourceReverification } from '@/components/settings/web-source-reverification';
 import { WebSourceRuns } from '@/components/settings/web-source-runs';
+import { WebSourceTrust } from '@/components/settings/web-source-trust';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { ConfirmationDialog } from '@/components/ui/confirmation-dialog';
@@ -31,7 +40,18 @@ function WebSourceDetailPage() {
 	const navigate = useNavigate();
 	const queryClient = useQueryClient();
 	const [showArchive, setShowArchive] = useState(false);
-	const robot = useQuery(trpc.webRobot.get.queryOptions({ id: robotId }));
+	const robot = useQuery({
+		...trpc.webRobot.get.queryOptions({ id: robotId }),
+		refetchInterval: (query) => {
+			const state = query.state.data?.currentState;
+			return state &&
+				(state.executionStatus === 'queued' ||
+					state.executionStatus === 'running' ||
+					state.publicationStatus === 'pending')
+				? 3000
+				: false;
+		},
+	});
 	const exportRobot = useQuery({ ...trpc.webRobot.exportRobot.queryOptions({ id: robotId }), enabled: false });
 	const runs = useQuery({
 		...trpc.webRobot.listRuns.queryOptions({ id: robotId, limit: 20 }),
@@ -53,8 +73,20 @@ function WebSourceDetailPage() {
 	};
 
 	const data = robot.data;
+	const currentState = data?.currentState;
+	const activeSummary = currentState?.activeSummary;
 	const activeRun = runs.data?.find((run) => isActiveWebRobotRun(run.status));
-	const summary = data ? recipeSummary(data.definition) : null;
+	const initialRecipe = data?.definition;
+	const hasPendingConfiguration = Boolean(data?.pendingConfiguration);
+	const trust = currentState ? catalogueTrustPresentation(currentState, { hasPendingConfiguration }) : null;
+	const primaryActionLabel = currentState
+		? webSourcePrimaryActionLabel({
+				state: currentState,
+				hasPendingConfiguration,
+				isActionPending: Boolean(activeRun) || runNow.isPending,
+			})
+		: null;
+	const scheduleLocked = !data?.lastPublishedRunId;
 
 	const handleExport = async () => {
 		const result = await exportRobot.refetch();
@@ -79,7 +111,7 @@ function WebSourceDetailPage() {
 		);
 	}
 
-	if (robot.error || !data) {
+	if (robot.error || !data || !currentState || !trust || !initialRecipe) {
 		return (
 			<SettingsPageWrapper>
 				<ErrorMessage message={robot.error?.message ?? 'Web source not found.'} />
@@ -101,12 +133,11 @@ function WebSourceDetailPage() {
 						<div className='flex flex-wrap items-center gap-2'>
 							<h1 className='text-lg font-semibold text-foreground'>{data.name}</h1>
 							<Badge variant='secondary'>{data.slug}</Badge>
-							{data.cron ? (
+							<Badge variant={trust.variant}>{trust.label}</Badge>
+							{data.cron && (
 								<Badge variant={data.enabled ? 'success' : 'outline'}>
-									{data.enabled ? 'enabled' : 'paused'}
+									{data.enabled ? 'schedule enabled' : 'schedule paused'}
 								</Badge>
-							) : (
-								<Badge variant='outline'>manual</Badge>
 							)}
 						</div>
 						{data.description && (
@@ -114,19 +145,23 @@ function WebSourceDetailPage() {
 						)}
 					</div>
 					<div className='flex gap-2'>
-						<Button
-							type='button'
-							variant='secondary'
-							disabled={Boolean(activeRun) || runNow.isPending}
-							isLoading={runNow.isPending}
-							onClick={async () => {
-								await runNow.mutateAsync({ id: data.id });
-								await invalidate();
-							}}
-						>
-							<Play className='size-3.5' />
-							Run now
-						</Button>
+						{primaryActionLabel && (
+							<Button
+								type='button'
+								variant='secondary'
+								disabled={
+									Boolean(activeRun) || runNow.isPending || currentState.setupStatus !== 'configured'
+								}
+								isLoading={runNow.isPending}
+								onClick={async () => {
+									await runNow.mutateAsync({ id: data.id });
+									await invalidate();
+								}}
+							>
+								<Play className='size-3.5' />
+								{primaryActionLabel}
+							</Button>
+						)}
 						<Button
 							type='button'
 							variant='ghost-muted'
@@ -149,15 +184,25 @@ function WebSourceDetailPage() {
 				{setEnabled.error && <ErrorMessage message={setEnabled.error.message} />}
 				{runs.error && <ErrorMessage message={runs.error.message} />}
 
+				<WebSourceTrust state={currentState} />
+
+				{currentState.setupStatus === 'needs_input' && (
+					<WebSourceReverification
+						robotId={data.id}
+						definitionHash={data.definitionHash}
+						onApplied={invalidate}
+					/>
+				)}
+
 				<SettingsCard
-					title='Publication'
-					description='Latest generated dataset and scheduling state.'
+					title='Active dataset'
+					description='Data currently available to agents and how it is refreshed.'
 					action={
 						data.cron ? (
 							<div className='flex items-center gap-2'>
 								<Switch
 									checked={data.enabled}
-									disabled={setEnabled.isPending}
+									disabled={setEnabled.isPending || scheduleLocked}
 									onCheckedChange={async (enabled) => {
 										await setEnabled.mutateAsync({ id: data.id, enabled });
 										await invalidate();
@@ -165,19 +210,33 @@ function WebSourceDetailPage() {
 								/>
 								<span className='text-sm'>{data.enabled ? 'Enabled' : 'Paused'}</span>
 							</div>
-						) : undefined
+						) : (
+							<Badge variant='outline'>Manual refresh</Badge>
+						)
 					}
 				>
+					{scheduleLocked && (
+						<p className='rounded-md border bg-muted/20 p-3 text-sm text-muted-foreground'>
+							Complete a successful first refresh before configuring automatic refreshes.
+						</p>
+					)}
 					<div className='grid gap-3 md:grid-cols-4'>
-						<SummaryStat label='Products' value={String(data.lastPublishedProductCount ?? '—')} />
-						<SummaryStat label='Last publish' value={formatDateTime(data.lastSuccessfulRunAt)} />
 						<SummaryStat
-							label='Next run'
+							label='Products available'
+							value={
+								activeSummary
+									? `${activeSummary.entityCount} ${catalogueGranularityLabel(activeSummary.granularity)}`
+									: '—'
+							}
+						/>
+						<SummaryStat label='Last refreshed' value={formatDateTime(data.lastPublishedRunAt)} />
+						<SummaryStat label='Schedule' value={data.cron || 'Manual'} />
+						<SummaryStat
+							label='Next refresh'
 							value={data.enabled ? formatDateTime(data.scheduledJob?.runAt) : '—'}
 						/>
-						<SummaryStat label='Stages' value={String(summary?.stageCount ?? '—')} />
 					</div>
-					{data.lastSuccessfulRunId && (
+					{currentState.activeRunId && (
 						<div className='rounded-md border bg-muted/20 p-3 font-mono text-xs text-muted-foreground'>
 							/datasets/{data.slug}/latest
 						</div>
@@ -185,9 +244,11 @@ function WebSourceDetailPage() {
 					{activeRun && (
 						<div className='flex flex-wrap items-center justify-between gap-2 rounded-md border border-amber-500/30 bg-amber-500/5 p-3'>
 							<div className='text-sm'>
-								<span className='font-medium'>{activeRun.status}</span>{' '}
+								<span className='font-medium'>
+									{catalogueExecutionLabel(activeRun.executionStatus)}
+								</span>{' '}
 								<span className='text-muted-foreground'>
-									queued {formatDateTime(activeRun.queuedAt)}
+									requested {formatDateTime(activeRun.queuedAt)}
 								</span>
 							</div>
 							<Button
@@ -197,32 +258,11 @@ function WebSourceDetailPage() {
 								isLoading={cancelRun.isPending && cancelRun.variables?.runId === activeRun.id}
 								onClick={() => handleCancelRun(activeRun)}
 							>
-								Cancel run
+								Cancel refresh
 							</Button>
 						</div>
 					)}
 				</SettingsCard>
-
-				<WebSourceForm
-					key={`${data.id}-${data.definitionHash}-${new Date(data.updatedAt).getTime()}`}
-					initial={{
-						name: data.name,
-						slug: data.slug,
-						description: data.description,
-						cron: data.cron,
-						enabled: data.enabled,
-						recipe: data.definition,
-					}}
-					isCreate={false}
-					submitLabel='Save changes'
-					isPending={update.isPending}
-					submitError={update.error?.message}
-					definitionHash={data.definitionHash}
-					onSubmit={async (value) => {
-						await update.mutateAsync({ id: data.id, ...value });
-						await invalidate();
-					}}
-				/>
 
 				{runs.data ? (
 					<WebSourceRuns
@@ -234,10 +274,33 @@ function WebSourceDetailPage() {
 						cancellingRunId={cancelRun.isPending ? cancelRun.variables?.runId : null}
 					/>
 				) : (
-					<SettingsCard title='Run history'>
-						<Empty>No run history loaded.</Empty>
+					<SettingsCard title='Refresh history'>
+						<Empty>No refresh history loaded.</Empty>
 					</SettingsCard>
 				)}
+
+				<WebSourceForm
+					key={`${data.id}-${data.definitionHash}-${new Date(data.updatedAt).getTime()}`}
+					initial={{
+						name: data.name,
+						slug: data.slug,
+						description: data.description,
+						cron: data.cron,
+						enabled: data.enabled,
+						recipe: initialRecipe,
+					}}
+					isCreate={false}
+					submitLabel='Save changes'
+					isPending={update.isPending}
+					submitError={update.error?.message}
+					definitionHash={data.definitionHash}
+					scheduleLocked={scheduleLocked}
+					recipeLocked={currentState.setupStatus === 'configured'}
+					onSubmit={async (value) => {
+						await update.mutateAsync({ id: data.id, ...value });
+						await invalidate();
+					}}
+				/>
 			</div>
 
 			<ConfirmationDialog

@@ -110,7 +110,12 @@ const apiRecipe = (discovery: WebRobotSourceDiscovery, candidate: WebRobotApiCan
 			headers: candidate.requestContentType ? { 'content-type': candidate.requestContentType } : {},
 			...(method === 'POST' ? { body: apiRequestBody(candidate.requestBody, paginate) } : {}),
 		},
-		{ type: 'json', itemsPath: candidate.itemsPath, fields: jsonFields(candidate.fields) },
+		{
+			type: 'json',
+			itemsPath: candidate.itemsPath,
+			...(candidate.where ? { where: candidate.where } : {}),
+			fields: jsonFields(candidate.fields),
+		},
 		paginate,
 		!detail,
 	);
@@ -278,7 +283,7 @@ const recipe = (
 	candidate: Pick<WebRobotApiCandidate, 'fields'> & { identityField?: string },
 	stages: Record<string, unknown>[],
 ): Record<string, unknown> => ({
-	version: 1,
+	version: 2,
 	allowedHosts: discovery.allowedHosts,
 	request: {
 		concurrency: 1,
@@ -295,7 +300,7 @@ const recipe = (
 		maxResponseBytes: 5 * 1024 * 1024,
 	},
 	publish: { minItems: 1, maxRemovedPercent: 50 },
-	identity: { fields: identityFields(candidate) },
+	identity: { strategy: 'first_present', fields: identityFields(candidate) },
 	respectRobotsTxt: false,
 	stages,
 });
@@ -584,9 +589,10 @@ const paginationFor = (
 			maxPages: 100,
 		};
 	}
-	const click = allowed
-		.filter((candidate) => candidate.type === 'click')
-		.sort((left, right) => Number(right.observed ?? false) - Number(left.observed ?? false))[0];
+	const click = allowed.find(
+		(candidate): candidate is Extract<WebRobotPaginationCandidate, { type: 'click' }> =>
+			candidate.type === 'click' && candidate.observed === true,
+	);
 	if (click) {
 		return {
 			type: 'click',
@@ -597,7 +603,10 @@ const paginationFor = (
 			maxPages: 100,
 		};
 	}
-	const scroll = allowed.find((candidate) => candidate.type === 'scroll');
+	const scroll = allowed.find(
+		(candidate): candidate is Extract<WebRobotPaginationCandidate, { type: 'scroll' }> =>
+			candidate.type === 'scroll' && candidate.observed === true,
+	);
 	if (scroll) {
 		return { type: 'scroll', waitMs: scroll.waitMs ?? 1_000, maxPages: 100 };
 	}
@@ -629,6 +638,7 @@ const paginationFor = (
 			pageVariable: page.pageVariable,
 			firstPage: 1,
 			...(page.totalPagesPath ? { totalPagesPath: page.totalPagesPath } : {}),
+			...(page.totalItemsPath ? { totalItemsPath: page.totalItemsPath } : {}),
 			maxPages: 100,
 		};
 	}

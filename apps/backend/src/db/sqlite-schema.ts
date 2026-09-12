@@ -16,6 +16,16 @@ import {
 	USER_ROLES,
 } from '@nao/shared/types';
 import type { WebRobotRecipe, WebRobotRunStats } from '@nao/shared/web-robot';
+import type {
+	CatalogueContract,
+	CatalogueGranularity,
+	CatalogueScope,
+	CatalogueTrustSummary,
+	CatalogueVerificationPlan,
+	CountSignal,
+	ScopeEvidence,
+	ScopeFitnessDecision,
+} from '@nao/shared/web-robot-trust';
 import { type ProviderMetadata } from 'ai';
 import { sql } from 'drizzle-orm';
 import {
@@ -60,7 +70,15 @@ import {
 } from '../types/messaging-provider';
 import { ORG_ROLES } from '../types/organization';
 import type { StoredUserPreferences } from '../types/usage';
-import { WEB_ROBOT_RUN_STATUSES, WEB_ROBOT_RUN_TRIGGERS } from '../types/web-robot';
+import {
+	WEB_ROBOT_CONFIGURATION_STATUSES,
+	WEB_ROBOT_EXECUTION_STATUSES,
+	WEB_ROBOT_PUBLICATION_STATUSES,
+	WEB_ROBOT_RUN_STATUSES,
+	WEB_ROBOT_RUN_TRIGGERS,
+	WEB_ROBOT_TRUST_BASES,
+	WEB_ROBOT_TRUST_STATUSES,
+} from '../types/web-robot';
 
 export const user = sqliteTable('user', {
 	id: text('id').primaryKey(),
@@ -1197,6 +1215,14 @@ export const webRobot = sqliteTable(
 		lastSuccessfulRunId: text('last_successful_run_id'),
 		lastSuccessfulRunAt: integer('last_successful_run_at', { mode: 'timestamp_ms' }),
 		lastPublishedProductCount: integer('last_published_product_count'),
+		activeConfigurationId: text('active_configuration_id'),
+		pendingConfigurationId: text('pending_configuration_id'),
+		lastVerifiedRunId: text('last_verified_run_id'),
+		lastVerifiedRunAt: integer('last_verified_run_at', { mode: 'timestamp_ms' }),
+		lastPublishedRunId: text('last_published_run_id'),
+		lastPublishedRunAt: integer('last_published_run_at', { mode: 'timestamp_ms' }),
+		lastPublishedEntityCount: integer('last_published_entity_count'),
+		lastPublishedEntityUnit: text('last_published_entity_unit').$type<CatalogueGranularity>(),
 		createdAt: integer('created_at', { mode: 'timestamp_ms' })
 			.default(sql`(cast(unixepoch('subsecond') * 1000 as integer))`)
 			.notNull(),
@@ -1211,6 +1237,43 @@ export const webRobot = sqliteTable(
 		index('web_robot_userId_idx').on(t.userId),
 		index('web_robot_scheduledJobId_idx').on(t.scheduledJobId),
 		index('web_robot_archivedAt_idx').on(t.archivedAt),
+		index('web_robot_activeConfigurationId_idx').on(t.activeConfigurationId),
+		index('web_robot_pendingConfigurationId_idx').on(t.pendingConfigurationId),
+		index('web_robot_lastPublishedRunId_idx').on(t.lastPublishedRunId),
+	],
+);
+
+export const webRobotConfiguration = sqliteTable(
+	'web_robot_configuration',
+	{
+		id: text('id')
+			.$defaultFn(() => crypto.randomUUID())
+			.primaryKey(),
+		robotId: text('robot_id')
+			.notNull()
+			.references(() => webRobot.id, { onDelete: 'cascade' }),
+		userId: text('user_id')
+			.notNull()
+			.references(() => user.id, { onDelete: 'cascade' }),
+		status: text('status', { enum: WEB_ROBOT_CONFIGURATION_STATUSES }).notNull().default('draft'),
+		recipe: text('recipe', { mode: 'json' }).$type<WebRobotRecipe>().notNull(),
+		recipeVersion: integer('recipe_version').notNull(),
+		recipeHash: text('recipe_hash').notNull(),
+		scope: text('scope', { mode: 'json' }).$type<CatalogueScope>().notNull(),
+		contract: text('contract', { mode: 'json' }).$type<CatalogueContract>().notNull(),
+		verificationPlan: text('verification_plan', { mode: 'json' }).$type<CatalogueVerificationPlan>().notNull(),
+		sourceAssessment: text('source_assessment', { mode: 'json' }).$type<ScopeFitnessDecision[]>().notNull(),
+		scopeEvidence: text('scope_evidence', { mode: 'json' }).$type<ScopeEvidence[]>().notNull(),
+		countSignals: text('count_signals', { mode: 'json' }).$type<CountSignal[]>().notNull(),
+		configurationHash: text('configuration_hash').notNull(),
+		createdAt: integer('created_at', { mode: 'timestamp_ms' })
+			.default(sql`(cast(unixepoch('subsecond') * 1000 as integer))`)
+			.notNull(),
+	},
+	(t) => [
+		unique('web_robot_configuration_robot_hash_unique').on(t.robotId, t.configurationHash),
+		index('web_robot_configuration_robotId_idx').on(t.robotId),
+		index('web_robot_configuration_status_idx').on(t.status),
 	],
 );
 
@@ -1233,6 +1296,27 @@ export const webRobotRun = sqliteTable(
 		artifactPrefix: text('artifact_prefix'),
 		errorMessage: text('error_message'),
 		cancelRequestedAt: integer('cancel_requested_at', { mode: 'timestamp_ms' }),
+		configurationId: text('configuration_id').references(() => webRobotConfiguration.id, {
+			onDelete: 'set null',
+		}),
+		configurationHash: text('configuration_hash'),
+		scopeSnapshot: text('scope_snapshot', { mode: 'json' }).$type<CatalogueScope>(),
+		contractSnapshot: text('contract_snapshot', { mode: 'json' }).$type<CatalogueContract>(),
+		verificationPlanSnapshot: text('verification_plan_snapshot', {
+			mode: 'json',
+		}).$type<CatalogueVerificationPlan>(),
+		executionStatus: text('execution_status', { enum: WEB_ROBOT_EXECUTION_STATUSES }).notNull().default('queued'),
+		trustStatus: text('trust_status', { enum: WEB_ROBOT_TRUST_STATUSES }),
+		trustBasis: text('trust_basis', { enum: WEB_ROBOT_TRUST_BASES }),
+		trustSummary: text('trust_summary', { mode: 'json' }).$type<CatalogueTrustSummary>(),
+		progress: text('progress', { mode: 'json' }).$type<Record<string, unknown>>(),
+		publicationStatus: text('publication_status', { enum: WEB_ROBOT_PUBLICATION_STATUSES })
+			.notNull()
+			.default('not_evaluated'),
+		trustReportPath: text('trust_report_path'),
+		trustReportHash: text('trust_report_hash'),
+		executionErrorMessage: text('execution_error_message'),
+		publicationErrorMessage: text('publication_error_message'),
 		queuedAt: integer('queued_at', { mode: 'timestamp_ms' })
 			.default(sql`(cast(unixepoch('subsecond') * 1000 as integer))`)
 			.notNull(),
@@ -1244,6 +1328,10 @@ export const webRobotRun = sqliteTable(
 		index('web_robot_run_robotId_queuedAt_idx').on(t.robotId, t.queuedAt),
 		index('web_robot_run_status_idx').on(t.status),
 		index('web_robot_run_scheduledJobId_idx').on(t.scheduledJobId),
+		index('web_robot_run_configurationId_idx').on(t.configurationId),
+		index('web_robot_run_executionStatus_idx').on(t.executionStatus),
+		index('web_robot_run_trustStatus_idx').on(t.trustStatus),
+		index('web_robot_run_publicationStatus_idx').on(t.publicationStatus),
 	],
 );
 

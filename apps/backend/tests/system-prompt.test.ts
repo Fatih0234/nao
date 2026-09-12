@@ -1,4 +1,5 @@
 import { LOCAL_DATABASE_ID } from '@nao/shared/tools';
+import type { CatalogueContract, CatalogueScope, CatalogueTrustSummary } from '@nao/shared/web-robot-trust';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { SystemPrompt } from '../src/components/ai/system-prompt';
@@ -313,5 +314,119 @@ describe('SystemPrompt display_map rules', () => {
 		expect(renderToMarkdown(SystemPrompt({ toolNames: ['execute_sql', 'display_chart'] }))).not.toContain(
 			'display_map',
 		);
+	});
+});
+
+type WebDatasetProp = NonNullable<Parameters<typeof SystemPrompt>[0]['webDatasets']>[number];
+
+describe('SystemPrompt web datasets', () => {
+	const scope: CatalogueScope = {
+		version: 1,
+		id: 'scope-1',
+		label: 'All products',
+		entryUrl: 'https://example.com/products',
+		includedUrls: ['https://example.com/products'],
+		excludedPatterns: [],
+		activeFilters: {},
+		selection: { mode: 'automatic', candidateId: 'api-1', confidence: 'high', rationale: [] },
+	};
+	const contract: CatalogueContract = {
+		version: 1,
+		entityGranularity: 'variant',
+		requiredConcepts: [
+			{ concept: 'name', required: true, minimumCoverage: 1 },
+			{ concept: 'specifications', required: true, minimumCoverage: 0.95 },
+		],
+		publishWhenReady: true,
+		createdAt: '2026-01-01T00:00:00.000Z',
+	};
+	const trustSummary: CatalogueTrustSummary = {
+		policyVersion: 1,
+		status: 'ready',
+		basis: 'count_reconciled',
+		scopeLabel: 'All products',
+		entityCount: 30,
+		granularity: 'variant',
+		verifiedAt: '2026-01-01T00:01:00.000Z',
+		dimensions: {
+			scope: { status: 'passed', reasons: [] },
+			records: { status: 'passed', reasons: [] },
+			identity: { status: 'passed', reasons: [] },
+			semantics: { status: 'passed', reasons: [] },
+			freshness: { status: 'passed', reasons: [] },
+		},
+		limitations: ['Price is displayed-only for 4 products.'],
+		requiredCoverage: [
+			{ concept: 'specifications', covered: 28, total: 30, coverage: 0.9333, minimumCoverage: 0.95 },
+		],
+		blockerCodes: [],
+	};
+	const dataset = (over: Partial<WebDatasetProp> = {}): WebDatasetProp => ({
+		name: 'Catalog',
+		slug: 'catalog',
+		activeRun: { id: 'run-1', trustSummary },
+		activeConfiguration: { scope, contract },
+		latestRun: {
+			id: 'run-1',
+			executionStatus: 'succeeded',
+			trustStatus: 'ready',
+			publicationStatus: 'published',
+		},
+		currentState: {
+			setupStatus: 'configured',
+			executionStatus: 'succeeded',
+			trustStatus: 'ready',
+			publicationStatus: 'published',
+			activeRunId: 'run-1',
+			latestRefreshFailed: false,
+		},
+		...over,
+	});
+
+	it('renders trust provenance for the active published dataset', () => {
+		const markdown = renderToMarkdown(SystemPrompt({ webDatasets: [dataset()] }));
+
+		expect(markdown).toContain('**/datasets/catalog/latest/README.md**');
+		expect(markdown).toContain('read its **README.md** trust provenance');
+		expect(markdown).toContain('Stay within the verified scope');
+		expect(markdown).toContain('families, variants, and offers');
+		expect(markdown).toContain('never query **/versions** or rejected/diagnostic runs as current data');
+		expect(markdown).toContain('Scope: All products (https://example.com/products)');
+		expect(markdown).toContain('Entities: 30 variant');
+		expect(markdown).toContain('Verification: Count reconciled');
+		expect(markdown).toContain('Verified: 2026-01-01T00:01:00.000Z');
+		expect(markdown).toContain('specifications 93% (minimum 95%)');
+		expect(markdown).toContain('Limitations: Price is displayed-only for 4 products.');
+		expect(markdown).toContain('Latest refresh: succeeded and published');
+		expect(markdown).toContain("'/datasets/catalog/latest/products.parquet'");
+	});
+
+	it('reports a failed latest refresh while retaining the active data', () => {
+		const markdown = renderToMarkdown(
+			SystemPrompt({
+				webDatasets: [
+					dataset({
+						latestRun: {
+							id: 'run-2',
+							executionStatus: 'succeeded',
+							trustStatus: 'needs_attention',
+							publicationStatus: 'retained_previous',
+						},
+						currentState: {
+							setupStatus: 'configured',
+							executionStatus: 'succeeded',
+							trustStatus: 'needs_attention',
+							publicationStatus: 'retained_previous',
+							activeRunId: 'run-1',
+							latestRefreshFailed: true,
+						},
+					}),
+				],
+			}),
+		);
+
+		expect(markdown).toContain('execution succeeded; trust needs_attention; publication retained_previous');
+		expect(markdown).toContain('active data retained');
+		expect(markdown).not.toContain('succeeded and published');
 	});
 });

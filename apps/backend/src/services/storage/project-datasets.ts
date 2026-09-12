@@ -12,17 +12,46 @@ import { LocalStorageProvider } from './local.provider';
 import type { StorageObject } from './types';
 import type { StorageDirectoryEntry } from './user-files';
 
+export type ResolvedProjectDatasetPath = {
+	requestedRelativePath: string;
+	storageRelativePath: string;
+};
+
+const AGENT_DATASET_MESSAGE = 'Only trusted /latest web datasets are available to agents.';
+
+export const resolveProjectDatasetPath = async (
+	projectId: string,
+	relativePath: string,
+): Promise<ResolvedProjectDatasetPath> => {
+	const requestedRelativePath = sanitizeRelativePath(relativePath);
+	const alias = latestAliasParts(requestedRelativePath);
+	if (!alias) {
+		return { requestedRelativePath, storageRelativePath: requestedRelativePath };
+	}
+	const webRobotQueries = await import('../../queries/web-robot.queries');
+	const published = await webRobotQueries.getPublishedWebDatasetBySlug(projectId, alias.slug);
+	if (!published) {
+		throw new Error(`No trusted published dataset exists for '${alias.slug}'.`);
+	}
+	const versionRoot = `${alias.slug}/versions/${published.activeRun.id}`;
+	return {
+		requestedRelativePath,
+		storageRelativePath: alias.suffix ? `${versionRoot}/${alias.suffix}` : versionRoot,
+	};
+};
+
 export const readProjectDataset = async (projectId: string, relativePath: string): Promise<string> => {
 	return toReadableText(relativePath, await readProjectDatasetBytes(projectId, relativePath));
 };
 
 export const readProjectDatasetBytes = async (projectId: string, relativePath: string): Promise<Buffer> => {
-	const key = projectDatasetKey(projectId, relativePath);
+	const resolved = await resolveProjectDatasetPath(projectId, relativePath);
+	const key = projectDatasetKey(projectId, resolved.storageRelativePath);
 	try {
 		return await getStorage().read(key);
 	} catch (error) {
 		if (isMissing(error)) {
-			throw new Error(`No such project dataset file: ${projectDatasetRelativePathFromKey(projectId, key)}`);
+			throw new Error(`No such project dataset file: ${resolved.requestedRelativePath}`);
 		}
 		throw error;
 	}
@@ -40,7 +69,12 @@ export const writeProjectDataset = async (
 };
 
 export const statProjectDataset = async (projectId: string, relativePath: string): Promise<StorageObject | null> => {
-	return getStorage().stat(projectDatasetKey(projectId, relativePath));
+	const resolved = await resolveProjectDatasetPath(projectId, relativePath);
+	const object = await getStorage().stat(projectDatasetKey(projectId, resolved.storageRelativePath));
+	if (object && resolved.storageRelativePath !== resolved.requestedRelativePath) {
+		return { ...object, key: projectDatasetKey(projectId, resolved.requestedRelativePath) };
+	}
+	return object;
 };
 
 export const deleteProjectDataset = async (projectId: string, relativePath: string): Promise<void> => {
@@ -73,7 +107,20 @@ export const listProjectDatasetDirectory = async (
 	projectId: string,
 	relativeDir: string,
 ): Promise<StorageDirectoryEntry[]> => {
-	const base = relativeDir === '' ? '' : `${sanitizeRelativePath(relativeDir)}/`;
+	const resolved = relativeDir === '' ? null : await resolveProjectDatasetPath(projectId, relativeDir);
+	const storageDir = resolved ? resolved.storageRelativePath : relativeDir;
+	const entries = await listDatasetDirectory(projectId, storageDir);
+	if (!resolved || resolved.storageRelativePath === resolved.requestedRelativePath) {
+		return entries;
+	}
+	return entries.map((entry) => ({
+		...entry,
+		relativePath: `${resolved.requestedRelativePath}${entry.relativePath.slice(resolved.storageRelativePath.length)}`,
+	}));
+};
+
+const listDatasetDirectory = async (projectId: string, relativeDir: string): Promise<StorageDirectoryEntry[]> => {
+	const base = relativeDir === '' ? '' : `${relativeDir}/`;
 	const objects = await getStorage().list(
 		relativeDir === '' ? projectDatasetRoot(projectId) : projectDatasetKey(projectId, relativeDir),
 	);
@@ -119,30 +166,197 @@ export const openProjectDatasetFiles = async (
 		throw new Error(STORAGE_DISABLED_MESSAGE);
 	}
 
+	const resolutions = await resolveProjectDatasetPaths(projectId, relativePaths);
+
 	const storage = getStorage();
 	if (storage instanceof LocalStorageProvider) {
-		await assertFilesExist(projectId, relativePaths);
+		for (const [relativePath, resolved] of resolutions) {
+			if (hasGlob(relativePath)) {
+				continue;
+			}
+			if (!(await getStorage().stat(projectDatasetKey(projectId, resolved.storageRelativePath)))) {
+				throw new Error(`No such project dataset file: ${relativePath}`);
+			}
+		}
 		return {
-			realPathOf: (relativePath) => storage.toFilePath(projectDatasetKey(projectId, relativePath)),
+			realPathOf: (relativePath) =>
+				storage.toFilePath(
+					projectDatasetKey(projectId, resolutions.get(relativePath)?.storageRelativePath ?? relativePath),
+				),
 			directory: storage.toFilePath(projectDatasetRoot(projectId)),
 			release: async () => {},
 		};
 	}
 
-	return stageDatasetFiles(projectId, relativePaths);
+	return stageDatasetFiles(projectId, resolutions);
 };
 
-const stageDatasetFiles = async (projectId: string, relativePaths: string[]): Promise<StorageFileAccess> => {
+export const readPublishedProjectDataset = async (projectId: string, relativePath: string): Promise<string> => {
+	assertLatestAlias(relativePath);
+	return readProjectDataset(projectId, relativePath);
+};
+
+export const listPublishedProjectDatasetDirectory = async (
+	projectId: string,
+	relativeDir: string,
+): Promise<StorageDirectoryEntry[]> => {
+	const trimmed = relativeDir.replace(/^\/+|\/+$/g, '');
+	if (trimmed === '') {
+		const webRobotQueries = await import('../../queries/web-robot.queries');
+		const published = await webRobotQueries.listPublishedWebDatasets(projectId);
+		return published
+			.map((row) => ({
+				name: row.slug,
+				relativePath: row.slug,
+				type: 'directory' as const,
+				itemCount: 1,
+			}))
+			.sort((a, b) => a.name.localeCompare(b.name));
+	}
+	const parts = trimmed.split('/');
+	if (parts.length === 1 && parts[0]) {
+		const webRobotQueries = await import('../../queries/web-robot.queries');
+		const published = await webRobotQueries.getPublishedWebDatasetBySlug(projectId, parts[0]);
+		if (!published) {
+			throw new Error(`No trusted published dataset exists for '${parts[0]}'.`);
+		}
+		return [{ name: 'latest', relativePath: `${parts[0]}/latest`, type: 'directory', itemCount: 1 }];
+	}
+	assertLatestAlias(trimmed);
+	return listProjectDatasetDirectory(projectId, trimmed);
+};
+
+export const findPublishedProjectDatasetFiles = async (
+	projectId: string,
+	predicate: (relativePath: string) => boolean,
+): Promise<StorageObject[]> => {
+	const webRobotQueries = await import('../../queries/web-robot.queries');
+	const published = await webRobotQueries.listPublishedWebDatasets(projectId);
+	const objects: StorageObject[] = [];
+	for (const row of published) {
+		const versionPrefix = `${row.slug}/versions/${row.activeRun.id}`;
+		const stored = await getStorage().list(projectDatasetKey(projectId, versionPrefix));
+		for (const object of stored) {
+			const relativePath = projectDatasetRelativePathFromKey(projectId, object.key);
+			if (!relativePath.startsWith(`${versionPrefix}/`)) {
+				continue;
+			}
+			const virtualPath = `${row.slug}/latest${relativePath.slice(versionPrefix.length)}`;
+			if (predicate(virtualPath)) {
+				objects.push({ ...object, key: projectDatasetKey(projectId, virtualPath) });
+			}
+		}
+	}
+	return objects;
+};
+
+export const openPublishedProjectDatasetFiles = async (
+	projectId: string,
+	relativePaths: string[],
+): Promise<StorageFileAccess> => {
+	for (const relativePath of relativePaths) {
+		assertLatestAlias(relativePath);
+	}
+	return openProjectDatasetFiles(projectId, relativePaths);
+};
+
+export const publishedProjectDatasetLocations = async (
+	projectId: string,
+	relativePath: string,
+): Promise<ResolvedProjectDatasetPath[]> => {
+	const webRobotQueries = await import('../../queries/web-robot.queries');
+	const trimmed = relativePath.replace(/^\/+|\/+$/g, '');
+	if (trimmed === '') {
+		const published = await webRobotQueries.listPublishedWebDatasets(projectId);
+		return published.map((row) => ({
+			requestedRelativePath: `${row.slug}/latest`,
+			storageRelativePath: `${row.slug}/versions/${row.activeRun.id}`,
+		}));
+	}
+	const parts = trimmed.split('/');
+	if (parts[1] === 'versions') {
+		throw new Error(AGENT_DATASET_MESSAGE);
+	}
+	if (parts.length === 1 && parts[0]) {
+		const published = await webRobotQueries.getPublishedWebDatasetBySlug(projectId, parts[0]);
+		if (!published) {
+			throw new Error(`No trusted published dataset exists for '${parts[0]}'.`);
+		}
+		return [
+			{
+				requestedRelativePath: `${parts[0]}/latest`,
+				storageRelativePath: `${parts[0]}/versions/${published.activeRun.id}`,
+			},
+		];
+	}
+	assertLatestAlias(trimmed);
+	return [await resolveProjectDatasetPath(projectId, trimmed)];
+};
+
+const resolveProjectDatasetPaths = async (
+	projectId: string,
+	relativePaths: string[],
+): Promise<Map<string, ResolvedProjectDatasetPath>> => {
+	const requested = new Map<string, string>();
+	for (const relativePath of new Set(relativePaths)) {
+		requested.set(relativePath, sanitizeRelativePath(relativePath));
+	}
+
+	if (![...requested.values()].some((path) => latestAliasParts(path))) {
+		return new Map(
+			[...requested].map(([relativePath, requestedRelativePath]) => [
+				relativePath,
+				{ requestedRelativePath, storageRelativePath: requestedRelativePath },
+			]),
+		);
+	}
+
+	const webRobotQueries = await import('../../queries/web-robot.queries');
+	const published = await webRobotQueries.listPublishedWebDatasets(projectId);
+	const activeRunBySlug = new Map(published.map((row) => [row.slug, row.activeRun.id]));
+
+	const resolutions = new Map<string, ResolvedProjectDatasetPath>();
+	for (const [relativePath, requestedRelativePath] of requested) {
+		const alias = latestAliasParts(requestedRelativePath);
+		if (!alias) {
+			resolutions.set(relativePath, { requestedRelativePath, storageRelativePath: requestedRelativePath });
+			continue;
+		}
+		const activeRunId = activeRunBySlug.get(alias.slug);
+		if (!activeRunId) {
+			throw new Error(`No trusted published dataset exists for '${alias.slug}'.`);
+		}
+		const versionRoot = `${alias.slug}/versions/${activeRunId}`;
+		resolutions.set(relativePath, {
+			requestedRelativePath,
+			storageRelativePath: alias.suffix ? `${versionRoot}/${alias.suffix}` : versionRoot,
+		});
+	}
+	return resolutions;
+};
+
+const stageDatasetFiles = async (
+	projectId: string,
+	resolutions: Map<string, ResolvedProjectDatasetPath>,
+): Promise<StorageFileAccess> => {
 	const directory = await mkdtemp(join(tmpdir(), 'nao-datasets-'));
 	const stagedPaths = new Map<string, string>();
 
 	try {
-		for (const relativePath of new Set(relativePaths)) {
+		for (const [relativePath, resolved] of resolutions) {
 			assertNotGlob(relativePath);
-			const safePath = sanitizeRelativePath(relativePath);
-			const stagedPath = join(directory, crypto.randomUUID(), basename(safePath));
+			const stagedPath = join(directory, crypto.randomUUID(), basename(resolved.storageRelativePath));
 			await mkdir(dirname(stagedPath), { recursive: true });
-			await writeFile(stagedPath, await readProjectDatasetBytes(projectId, relativePath));
+			let bytes: Buffer;
+			try {
+				bytes = await getStorage().read(projectDatasetKey(projectId, resolved.storageRelativePath));
+			} catch (error) {
+				if (isMissing(error)) {
+					throw new Error(`No such project dataset file: ${resolved.requestedRelativePath}`);
+				}
+				throw error;
+			}
+			await writeFile(stagedPath, bytes);
 			stagedPaths.set(relativePath, stagedPath);
 		}
 	} catch (error) {
@@ -163,14 +377,19 @@ const stageDatasetFiles = async (projectId: string, relativePaths: string[]): Pr
 	};
 };
 
-const assertFilesExist = async (projectId: string, relativePaths: string[]): Promise<void> => {
-	for (const relativePath of new Set(relativePaths)) {
-		if (hasGlob(relativePath)) {
-			continue;
-		}
-		if (!(await statProjectDataset(projectId, relativePath))) {
-			throw new Error(`No such project dataset file: ${relativePath}`);
-		}
+const latestAliasParts = (relativePath: string): { slug: string; suffix: string } | null => {
+	const parts = relativePath.split('/');
+	if (parts.length < 2 || parts[1] !== 'latest') {
+		return null;
+	}
+	const slug = parts[0]!;
+	return { slug, suffix: parts.slice(2).join('/') };
+};
+
+const assertLatestAlias = (relativePath: string): void => {
+	const parts = relativePath.split('/').filter(Boolean);
+	if (parts.length < 2 || parts[1] !== 'latest') {
+		throw new Error(AGENT_DATASET_MESSAGE);
 	}
 };
 

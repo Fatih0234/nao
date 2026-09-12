@@ -3,7 +3,14 @@ import os from 'node:os';
 import path from 'node:path';
 
 import type { Tool } from 'ai';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+const webRobotQueries = vi.hoisted(() => ({
+	getPublishedWebDatasetBySlug: vi.fn(),
+	listPublishedWebDatasets: vi.fn(),
+}));
+
+vi.mock('../src/queries/web-robot.queries', () => webRobotQueries);
 
 import grepTool from '../src/agents/tools/grep';
 import listTool from '../src/agents/tools/list';
@@ -21,11 +28,25 @@ let originalEnv: typeof process.env;
 
 const context = () => ({ projectFolder, projectId: 'proj-1', userId: 'user-1' }) as unknown as ToolContext;
 
+const mockPublished = (rows: { slug: string; runId: string }[]) => {
+	const datasets = rows.map(({ slug, runId }) => ({
+		slug,
+		name: slug,
+		activeRun: { id: runId },
+		activeConfiguration: { id: `cfg-${runId}` },
+	}));
+	webRobotQueries.getPublishedWebDatasetBySlug.mockImplementation(
+		async (_projectId: string, slug: string) => datasets.find((row) => row.slug === slug) ?? null,
+	);
+	webRobotQueries.listPublishedWebDatasets.mockImplementation(async () => datasets);
+};
+
 beforeEach(async () => {
 	originalEnv = { ...process.env };
 	storageRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'nao-storage-tools-'));
 	projectFolder = await fs.mkdtemp(path.join(os.tmpdir(), 'nao-project-tools-'));
 
+	mockPublished([]);
 	useBackend('local');
 });
 
@@ -99,11 +120,21 @@ describe('read', () => {
 	});
 
 	it('reads a generated dataset README', async () => {
-		await writeProjectDataset('proj-1', 'catalog/latest/README.md', 'catalog docs');
+		await writeProjectDataset('proj-1', 'catalog/versions/run-1/README.md', 'catalog docs');
+		mockPublished([{ slug: 'catalog', runId: 'run-1' }]);
 
 		expect(await run(readTool, { file_path: '/datasets/catalog/latest/README.md' })).toMatchObject({
 			content: 'catalog docs',
 		});
+	});
+
+	it('rejects a direct immutable version path', async () => {
+		await writeProjectDataset('proj-1', 'catalog/versions/run-0/README.md', 'rejected docs');
+		mockPublished([{ slug: 'catalog', runId: 'run-1' }]);
+
+		await expect(run(readTool, { file_path: '/datasets/catalog/versions/run-0/README.md' })).rejects.toThrow(
+			'Only trusted /latest web datasets are available to agents.',
+		);
 	});
 });
 
@@ -153,8 +184,9 @@ describe('list', () => {
 	});
 
 	it('lists generated project datasets', async () => {
-		await writeProjectDataset('proj-1', 'catalog/latest/products.parquet', 'parquet-bytes');
-		await writeProjectDataset('proj-1', 'catalog/latest/README.md', 'docs');
+		await writeProjectDataset('proj-1', 'catalog/versions/run-1/products.parquet', 'parquet-bytes');
+		await writeProjectDataset('proj-1', 'catalog/versions/run-1/README.md', 'docs');
+		mockPublished([{ slug: 'catalog', runId: 'run-1' }]);
 
 		expect(await run(listTool, { path: '/datasets/catalog/latest' })).toEqual({
 			_version: '1',
@@ -175,6 +207,14 @@ describe('list', () => {
 				},
 			],
 		});
+	});
+
+	it('rejects listing a direct version directory', async () => {
+		mockPublished([{ slug: 'catalog', runId: 'run-1' }]);
+
+		await expect(run(listTool, { path: '/datasets/catalog/versions/run-1' })).rejects.toThrow(
+			'Only trusted /latest web datasets are available to agents.',
+		);
 	});
 
 	it('still lists the project folder', async () => {
@@ -209,12 +249,21 @@ describe('search', () => {
 	});
 
 	it('finds generated dataset files by name', async () => {
-		await writeProjectDataset('proj-1', 'catalog/latest/products.parquet', 'parquet-bytes');
+		await writeProjectDataset('proj-1', 'catalog/versions/run-1/products.parquet', 'parquet-bytes');
+		mockPublished([{ slug: 'catalog', runId: 'run-1' }]);
 
 		expect(await run(searchTool, { pattern: 'datasets/**/*.parquet' })).toEqual({
 			_version: '1',
 			files: [{ path: '/datasets/catalog/latest/products.parquet', dir: '/datasets/catalog/latest', size: '13' }],
 		});
+	});
+
+	it('never surfaces rejected or untrusted versions', async () => {
+		await writeProjectDataset('proj-1', 'catalog/versions/run-0/products.parquet', 'rejected');
+		await writeProjectDataset('proj-1', 'untrusted/versions/run-5/products.parquet', 'untrusted');
+		mockPublished([{ slug: 'catalog', runId: 'run-1' }]);
+
+		expect(await run(searchTool, { pattern: 'datasets/**/*.parquet' })).toEqual({ _version: '1', files: [] });
 	});
 
 	it('leaves saved files out when storage is disabled', async () => {
@@ -249,11 +298,22 @@ describe('grep', () => {
 	});
 
 	it('can be scoped to /datasets', async () => {
-		await writeProjectDataset('proj-1', 'catalog/latest/README.md', 'catalog revenue docs');
+		await writeProjectDataset('proj-1', 'catalog/versions/run-1/README.md', 'catalog revenue docs');
+		await writeProjectDataset('proj-1', 'catalog/versions/run-0/README.md', 'rejected revenue docs');
+		mockPublished([{ slug: 'catalog', runId: 'run-1' }]);
 
-		expect(await pathsMatching({ pattern: 'catalog revenue', path: '/datasets' })).toEqual([
+		expect(await pathsMatching({ pattern: 'revenue', path: '/datasets' })).toEqual([
 			'/datasets/catalog/latest/README.md',
 		]);
+	});
+
+	it('refuses to grep a direct version path', async () => {
+		await writeProjectDataset('proj-1', 'catalog/versions/run-0/README.md', 'rejected revenue docs');
+		mockPublished([{ slug: 'catalog', runId: 'run-1' }]);
+
+		await expect(pathsMatching({ pattern: 'revenue', path: '/datasets/catalog/versions/run-0' })).rejects.toThrow(
+			'Only trusted /latest web datasets are available to agents.',
+		);
 	});
 
 	it('keeps valid names that merely start with two dots', async () => {

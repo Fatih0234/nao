@@ -150,12 +150,12 @@ const SYSTEM_PROMPT = `You generate deterministic nao web robot recipes from bou
 Return JSON only, either one recipe object or { "recipes": [recipe] }. Do not include prose or markdown.
 
 Recipe contract:
-- version must be 1.
+- version must be 2.
 - allowedHosts is supplied by the caller; repeat it exactly.
 - request has concurrency, delayMs, timeoutMs, retries, userAgent.
 - limits has maxPages, maxItems, maxRequests, maxDurationMs, maxResponseBytes.
 - publish has minItems and maxRemovedPercent.
-- identity.fields must name stable extracted fields such as sku or url.
+- identity must be { "strategy": "first_present", "fields": [...] } where fields names stable extracted fields such as sku or url.
 - respectRobotsTxt must be false.
 - stages is an ordered array of { id, forEach?, source, paginate?, extract?, emit?, output? }.
 
@@ -194,12 +194,12 @@ Rules:
 
 Example shape:
 {
-  "version": 1,
+  "version": 2,
   "allowedHosts": ["www.example.com"],
   "request": { "concurrency": 1, "delayMs": 500, "timeoutMs": 20000, "retries": 2, "userAgent": "nao-web-robot/1.0" },
   "limits": { "maxPages": 100, "maxItems": 2000, "maxRequests": 1000, "maxDurationMs": 900000, "maxResponseBytes": 5242880 },
   "publish": { "minItems": 1, "maxRemovedPercent": 50 },
-  "identity": { "fields": ["sku", "url"] },
+  "identity": { "strategy": "first_present", "fields": ["sku", "url"] },
   "respectRobotsTxt": false,
   "stages": [
     {

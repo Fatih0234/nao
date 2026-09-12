@@ -1,70 +1,131 @@
 import type { WebRobotRecipe, WebRobotSource } from '@nao/shared/web-robot';
 
-import { delay, headersForOrigin, readResponseWithLimit, resolveHeaders } from './request';
+import { delay, headersForOrigin, readResponseWithLimit, renderHttpRequest } from './request';
 import type { TemplateScope } from './template';
-import { renderTemplate } from './template';
-import type { WebRobotLoadedSource } from './types';
-import { assertPublicHttpUrl, canonicalHttpUrl, WebRobotUrlError } from './url-policy';
+import { renderedRequestEvidence, responseFingerprint, sanitizeTraversalError } from './traversal-evidence';
+import type { WebRobotLoadedSource, WebRobotRequestAttempt, WebRobotRequestPolicy } from './types';
+import { assertPublicHttpUrl, WebRobotUrlError } from './url-policy';
 
 type HttpLikeSource = Extract<WebRobotSource, { type: 'http' | 'api' }>;
 
-class RetryableHttpError extends Error {}
+const MAX_RETRY_AFTER_MS = 30_000;
+
+class RetryableHttpError extends Error {
+	status?: number;
+	retryAfterMs?: number;
+}
+
+export class WebRobotRequestPolicyError extends Error {
+	readonly rateLimited: boolean;
+
+	constructor(message: string, rateLimited = false) {
+		super(message);
+		this.name = 'WebRobotRequestPolicyError';
+		this.rateLimited = rateLimited;
+	}
+}
+
+export class WebRobotLoadError extends Error {
+	readonly requestAttempts: WebRobotRequestAttempt[];
+	readonly targetFingerprint?: string;
+	readonly redactedTarget?: string;
+
+	constructor(
+		message: string,
+		requestAttempts: WebRobotRequestAttempt[],
+		target?: { fingerprint: string; redactedTarget: string },
+	) {
+		super(message);
+		this.name = 'WebRobotLoadError';
+		this.requestAttempts = requestAttempts;
+		this.targetFingerprint = target?.fingerprint;
+		this.redactedTarget = target?.redactedTarget;
+	}
+}
 
 export type HttpLoaderOptions = {
 	recipe: WebRobotRecipe;
 	scope: TemplateScope;
 	env: Record<string, string>;
 	signal?: AbortSignal;
+	requestPolicy?: WebRobotRequestPolicy;
 };
 
 export const loadHttpSource = async (
 	source: HttpLikeSource,
 	options: HttpLoaderOptions,
 ): Promise<WebRobotLoadedSource> => {
-	const rendered = renderTemplate(source, options.scope);
-	const initialUrl = buildRequestUrl(rendered);
-	const headers = resolveHeaders(rendered.headers, options.env);
-	const body = requestBody(rendered);
-	if (isJsonBody(rendered.body) && !hasHeader(headers, 'content-type')) {
-		headers['content-type'] = 'application/json';
-	}
+	const rendered = renderHttpRequest(source, options.scope, options.env);
+	const target = renderedRequestEvidence(rendered);
 	const request = {
 		method: rendered.method,
 		headers: {
 			...(options.recipe.request.userAgent ? { 'user-agent': options.recipe.request.userAgent } : {}),
-			...headers,
+			...rendered.headers,
 		},
-		body,
+		body: rendered.body,
 	};
 
-	return fetchWithPolicy(initialUrl, request, options);
+	return fetchWithPolicy(rendered.url, request, options, target);
 };
 
 const fetchWithPolicy = async (
 	initialUrl: URL,
 	request: { method: string; headers: Record<string, string>; body?: BodyInit },
 	options: HttpLoaderOptions,
+	target: { fingerprint: string; redactedTarget: string },
 ): Promise<WebRobotLoadedSource> => {
 	const url = initialUrl;
 	let requestCount = 0;
 	let lastError: unknown;
+	const requestAttempts: WebRobotRequestAttempt[] = [];
 
 	for (let attempt = 0; attempt <= options.recipe.request.retries; attempt += 1) {
+		const startedAt = new Date().toISOString();
 		try {
 			const result = await fetchFollowingRedirects(url, request, options, () => {
 				requestCount += 1;
 			});
-			return { ...result, requests: requestCount };
+			requestAttempts.push({
+				attempt,
+				startedAt,
+				completedAt: new Date().toISOString(),
+				status: result.status,
+			});
+			return {
+				...result,
+				requests: requestCount,
+				renderedTargetFingerprint: target.fingerprint,
+				redactedTarget: target.redactedTarget,
+				responseFingerprint: responseFingerprint(result),
+				requestAttempts,
+			};
 		} catch (error) {
 			lastError = error;
-			if (!isRetryable(error) || attempt === options.recipe.request.retries) {
+			const retryable = error instanceof RetryableHttpError ? error : undefined;
+			requestAttempts.push({
+				attempt,
+				startedAt,
+				completedAt: new Date().toISOString(),
+				status: retryable?.status,
+				error: sanitizeTraversalError(error),
+				retryAfterMs: retryable?.retryAfterMs,
+			});
+			if (retryable?.status === 429 && options.requestPolicy) {
 				break;
 			}
-			await delay(Math.min(2_000, 250 * 2 ** attempt), options.signal);
+			if (!isRetryable(error, options.signal) || attempt === options.recipe.request.retries) {
+				break;
+			}
+			const fallbackMs =
+				retryable?.status === 429
+					? Math.min(30_000, 5_000 * 2 ** attempt)
+					: Math.min(2_000, 250 * 2 ** attempt);
+			await delay(retryable?.retryAfterMs ?? fallbackMs, options.signal);
 		}
 	}
 
-	throw lastError instanceof Error ? lastError : new Error(String(lastError));
+	throw new WebRobotLoadError(sanitizeTraversalError(lastError), requestAttempts, target);
 };
 
 const fetchFollowingRedirects = async (
@@ -80,6 +141,7 @@ const fetchFollowingRedirects = async (
 	const initialOrigin = initialUrl.origin;
 	for (let redirectCount = 0; redirectCount <= 5; redirectCount += 1) {
 		await assertPublicHttpUrl(url.toString(), options.recipe.allowedHosts);
+		await options.requestPolicy?.beforeRequest(url.toString());
 		onRequest();
 
 		const response = await fetch(url, {
@@ -89,10 +151,15 @@ const fetchFollowingRedirects = async (
 			redirect: 'manual',
 			signal: requestSignal(options),
 		});
+		options.requestPolicy?.observeResponse(url.toString(), response);
 
 		if (!isRedirect(response.status)) {
-			if (response.status === 429 || response.status >= 500) {
-				throw new RetryableHttpError(`HTTP ${response.status} while fetching ${url.toString()}`);
+			if (response.status === 408 || response.status === 429 || response.status >= 500) {
+				await response.body?.cancel().catch(() => undefined);
+				const error = new RetryableHttpError(`HTTP ${response.status} while fetching request target`);
+				error.status = response.status;
+				error.retryAfterMs = retryAfterMs(response.headers.get('retry-after'));
+				throw error;
 			}
 			return toLoadedSource(response, url, options.recipe.limits.maxResponseBytes);
 		}
@@ -112,49 +179,19 @@ const fetchFollowingRedirects = async (
 	throw new Error(`Too many redirects while fetching ${initialUrl.toString()}`);
 };
 
-const buildRequestUrl = (source: HttpLikeSource): URL => {
-	const url = new URL(canonicalHttpUrl(source.url));
-	if (source.type !== 'api') {
-		return url;
-	}
-
-	for (const [key, value] of Object.entries(source.query)) {
-		if (value === undefined || value === null) {
-			continue;
-		}
-		if (Array.isArray(value)) {
-			for (const entry of value) {
-				url.searchParams.append(key, String(entry));
-			}
-			continue;
-		}
-		url.searchParams.set(key, typeof value === 'object' ? JSON.stringify(value) : String(value));
-	}
-
-	return url;
-};
-
-const isJsonBody = (body: unknown): boolean => {
-	return (
-		body !== undefined &&
-		body !== null &&
-		typeof body === 'object' &&
-		!(body instanceof FormData) &&
-		!(body instanceof URLSearchParams)
-	);
-};
-
-const hasHeader = (headers: Record<string, string>, name: string): boolean => {
-	return Object.keys(headers).some((header) => header.toLowerCase() === name);
-};
-
-const requestBody = (source: HttpLikeSource): BodyInit | undefined => {
-	if (source.body === undefined || source.body === null || source.method === 'GET') {
+export const retryAfterMs = (header: string | null): number | undefined => {
+	if (!header) {
 		return undefined;
 	}
-	return typeof source.body === 'string' || source.body instanceof FormData || source.body instanceof URLSearchParams
-		? source.body
-		: JSON.stringify(source.body);
+	const seconds = Number(header);
+	if (Number.isFinite(seconds)) {
+		return Math.min(Math.max(seconds * 1_000, 0), MAX_RETRY_AFTER_MS);
+	}
+	const date = Date.parse(header);
+	if (!Number.isNaN(date)) {
+		return Math.min(Math.max(date - Date.now(), 0), MAX_RETRY_AFTER_MS);
+	}
+	return undefined;
 };
 
 const toLoadedSource = async (
@@ -201,12 +238,21 @@ const requestSignal = (options: HttpLoaderOptions): AbortSignal => {
 
 const isRedirect = (status: number): boolean => [301, 302, 303, 307, 308].includes(status);
 
-const isRetryable = (error: unknown): boolean => {
+const isRetryable = (error: unknown, signal?: AbortSignal): boolean => {
+	if (signal?.aborted) {
+		return false;
+	}
+	if (error instanceof WebRobotRequestPolicyError) {
+		return false;
+	}
 	if (error instanceof RetryableHttpError) {
 		return true;
 	}
 	if (error instanceof WebRobotUrlError) {
 		return false;
 	}
-	return !(error instanceof Error) || (error.name !== 'AbortError' && error.name !== 'TimeoutError');
+	if (error instanceof Error && error.message.includes('byte limit')) {
+		return false;
+	}
+	return true;
 };

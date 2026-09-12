@@ -9,6 +9,13 @@ vi.mock('../src/queries/chat.queries', () => ({
 	getQueryResultByQueryId: vi.fn(async () => null),
 }));
 
+const webRobotQueries = vi.hoisted(() => ({
+	getPublishedWebDatasetBySlug: vi.fn(),
+	listPublishedWebDatasets: vi.fn(),
+}));
+
+vi.mock('../src/queries/web-robot.queries', () => webRobotQueries);
+
 import type { executeSql } from '@nao/shared/tools';
 
 import { __reloadEnvForTesting } from '../src/env';
@@ -20,6 +27,19 @@ import { statUserFile, writeUserFile } from '../src/services/storage/user-files'
 import type { QueryResult, ToolContext } from '../src/types/tools';
 
 const scope = { projectId: 'proj-1', userId: 'user-1' };
+
+const mockPublished = (rows: { slug: string; runId: string }[]) => {
+	const datasets = rows.map(({ slug, runId }) => ({
+		slug,
+		name: slug,
+		activeRun: { id: runId },
+		activeConfiguration: { id: `cfg-${runId}` },
+	}));
+	webRobotQueries.getPublishedWebDatasetBySlug.mockImplementation(
+		async (_projectId: string, slug: string) => datasets.find((row) => row.slug === slug) ?? null,
+	);
+	webRobotQueries.listPublishedWebDatasets.mockImplementation(async () => datasets);
+};
 
 let storageRoot: string;
 let projectFolder: string;
@@ -38,6 +58,7 @@ beforeEach(async () => {
 	process.env.NAO_STORAGE_LOCAL_PATH = storageRoot;
 	__reloadEnvForTesting();
 	__resetStorageForTesting();
+	mockPublished([]);
 });
 
 afterEach(async () => {
@@ -88,15 +109,26 @@ describe('querying saved files', () => {
 	});
 
 	it('reads generated project datasets by their /datasets path', async () => {
-		await writeProjectDataset(scope.projectId, 'catalog/latest/products.csv', 'sku,name\nA-1,Product A\n');
+		await writeProjectDataset(scope.projectId, 'catalog/versions/run-1/products.csv', 'sku,name\nA-1,Product A\n');
+		mockPublished([{ slug: 'catalog', runId: 'run-1' }]);
 
 		const result = await run("SELECT sku, name FROM read_csv('/datasets/catalog/latest/products.csv')");
 
 		expect(result.data).toEqual([{ sku: 'A-1', name: 'Product A' }]);
 	});
 
+	it('refuses a guessed immutable version path', async () => {
+		await writeProjectDataset(scope.projectId, 'catalog/versions/run-0/products.csv', 'sku,name\nR-0,Rejected\n');
+		mockPublished([{ slug: 'catalog', runId: 'run-1' }]);
+
+		await expect(run("SELECT sku FROM read_csv('/datasets/catalog/versions/run-0/products.csv')")).rejects.toThrow(
+			'Only trusted /latest web datasets are available to agents.',
+		);
+	});
+
 	it('joins generated project data to a user file in the same query', async () => {
-		await writeProjectDataset(scope.projectId, 'catalog/latest/products.csv', 'sku,name\nA-1,Product A\n');
+		await writeProjectDataset(scope.projectId, 'catalog/versions/run-1/products.csv', 'sku,name\nA-1,Product A\n');
+		mockPublished([{ slug: 'catalog', runId: 'run-1' }]);
 		await writeUserFile(scope, 'watchlist.csv', 'sku\nA-1\n');
 
 		const result = await run(

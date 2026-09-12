@@ -909,6 +909,80 @@ describe('web robot runner', () => {
 			vi.mocked(fetch).mock.calls.filter(([input]) => String(input).includes('evil.example.com')),
 		).toHaveLength(0);
 	});
+
+	it('reuses a cached HTTP catalogue page without fetching', async () => {
+		const cached = {
+			url: 'https://example.com/products',
+			finalUrl: 'https://example.com/products',
+			status: 200,
+			contentType: 'text/html',
+			bodyText: `<main><article class="card"><a href="/p/a"><span class="title">Product A</span></a></article></main>`,
+			captures: [],
+			requests: 3,
+		};
+		const responseCache = new Map([['https://example.com/products', cached]]);
+		const requestPolicy = { beforeRequest: vi.fn(async () => undefined), observeResponse: vi.fn() };
+		const recipe = webRobotRecipeSchema.parse({
+			version: 1,
+			allowedHosts: ['example.com'],
+			request: { delayMs: 0, retries: 0 },
+			stages: [
+				{
+					id: 'products',
+					source: { type: 'http', url: 'https://example.com/products' },
+					extract: {
+						type: 'dom',
+						itemSelector: '.card',
+						fields: {
+							name: { selector: '.title', required: true },
+							url: { selector: 'a', attr: 'href', required: true, transforms: ['absoluteUrl'] },
+						},
+					},
+					output: 'product',
+				},
+			],
+		});
+
+		const result = await runWebRobotRecipe({ recipe, requestPolicy, responseCache });
+
+		expect(result.products.map((product) => product.name)).toEqual(['Product A']);
+		expect(result.stats.pagesFetched).toBe(1);
+		expect(result.stats.requests).toBe(0);
+		expect(vi.mocked(fetch)).not.toHaveBeenCalled();
+		expect(requestPolicy.beforeRequest).not.toHaveBeenCalled();
+	});
+
+	it('reports a browser 429 response to the request policy', async () => {
+		vi.spyOn(WebRobotBrowserSession.prototype, 'load').mockResolvedValue({
+			url: 'https://example.com/products',
+			finalUrl: 'https://example.com/products',
+			status: 429,
+			captures: [],
+			requests: 1,
+		});
+		vi.spyOn(WebRobotBrowserSession.prototype, 'close').mockResolvedValue(undefined);
+		const requestPolicy = { beforeRequest: vi.fn(async () => undefined), observeResponse: vi.fn() };
+		const recipe = webRobotRecipeSchema.parse({
+			version: 1,
+			allowedHosts: ['example.com'],
+			request: { delayMs: 0, retries: 0 },
+			stages: [
+				{
+					id: 'products',
+					source: { type: 'browser', url: 'https://example.com/products' },
+					output: 'product',
+				},
+			],
+		});
+
+		await runWebRobotRecipe({ recipe, requestPolicy });
+
+		expect(requestPolicy.beforeRequest).toHaveBeenCalledWith('https://example.com/products');
+		expect(requestPolicy.observeResponse).toHaveBeenCalledWith(
+			'https://example.com/products',
+			expect.objectContaining({ status: 429 }),
+		);
+	});
 });
 
 const jsonResponse = (body: unknown): Response => {

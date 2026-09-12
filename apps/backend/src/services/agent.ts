@@ -613,7 +613,7 @@ class AgentManager {
 			: [];
 		const [mcpServers, webDatasets] = await Promise.all([
 			mcpService.getEnabledServers(this.chat.projectId),
-			webRobotQueries.listPublishedWebDatasets(this.chat.projectId),
+			webRobotQueries.listAgentWebDatasets(this.chat.projectId),
 		]);
 		const basePrompt = renderToMarkdown(
 			SystemPrompt({

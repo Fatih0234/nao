@@ -1,10 +1,13 @@
-import { emptyWebRobotRunStats, type WebRobotRecipe } from '@nao/shared/web-robot';
+import { emptyWebRobotRunStats } from '@nao/shared/web-robot';
 
 import type { DBScheduledJob, DBWebRobotRun } from '../db/abstractSchema';
 import * as projectQueries from '../queries/project.queries';
 import * as webRobotQueries from '../queries/web-robot.queries';
-import { publishWebRobotRunArtifacts } from '../services/web-robot-artifacts';
-import { runWebRobotRecipe } from '../services/web-scraper';
+import { webRobotRunSnapshot } from '../services/web-robot';
+import { webRobotRunArtifactPaths, writeWebRobotRunArtifacts } from '../services/web-robot-artifacts';
+import { webRobotConfigurationHash } from '../services/web-robot-configuration';
+import { reconcileCatalogueTrust } from '../services/web-robot-trust/reconcile';
+import { runWebRobotVerification } from '../services/web-scraper/traversal';
 import { logger, serializeError } from '../utils/logger';
 
 export const WEB_ROBOT_JOB_NAME = 'web_robot.run';
@@ -56,79 +59,179 @@ export const webRobotRunJob = async (payload: WebRobotJobPayload, job: DBSchedul
 	const abort = new AbortController();
 	activeRuns.set(run.id, abort);
 	try {
+		if (
+			!claimed.configurationId ||
+			!claimed.configurationHash ||
+			!claimed.scopeSnapshot ||
+			!claimed.contractSnapshot ||
+			!claimed.verificationPlanSnapshot
+		) {
+			throw new Error(
+				'This web robot run has no valid verification configuration. Re-analyze the source before running it.',
+			);
+		}
+		const configuration = await webRobotQueries.getWebRobotConfiguration(robot.id, claimed.configurationId);
+		if (
+			!configuration ||
+			configuration.recipeHash !== claimed.definitionHash ||
+			configuration.configurationHash !== claimed.configurationHash
+		) {
+			throw new Error(
+				'This web robot run has no valid verification configuration. Re-analyze the source before running it.',
+			);
+		}
+		const snapshotHash = webRobotConfigurationHash({
+			recipe: claimed.definition,
+			scope: claimed.scopeSnapshot,
+			contract: claimed.contractSnapshot,
+			verificationPlan: claimed.verificationPlanSnapshot,
+			sourceAssessment: configuration.sourceAssessment,
+			scopeEvidence: configuration.scopeEvidence,
+			countSignals: configuration.countSignals,
+		});
+		if (snapshotHash !== claimed.configurationHash) {
+			throw new Error(
+				'This web robot run has no valid verification configuration. Re-analyze the source before running it.',
+			);
+		}
+
+		const onProgress = createProgressWriter(run.id);
 		const envVars = await projectQueries.getEnvVars(robot.projectId);
-		const result = await runWebRobotRecipe({
+		const result = await runWebRobotVerification({
 			recipe: claimed.definition,
 			runId: run.id,
 			env: envVars,
 			signal: abort.signal,
+			verificationPlan: claimed.verificationPlanSnapshot,
+			countSignals: configuration.countSignals,
+			entityGranularity: claimed.contractSnapshot.entityGranularity,
+			onProgress,
 		});
 		const requested = await webRobotQueries.getWebRobotRunById(run.id);
 		if (abort.signal.aborted || requested?.cancelRequestedAt) {
 			throw new Error('Web robot run was cancelled');
 		}
 		const completedAt = new Date();
-		const artifacts = await publishWebRobotRunArtifacts({
-			projectId: robot.projectId,
-			robotName: robot.name,
-			robotSlug: robot.slug,
+		const paths = webRobotRunArtifactPaths(robot.slug, run.id);
+		const stagedResult = {
+			...result,
+			traversals: result.traversals.map((traversal) => ({
+				...traversal,
+				attempts: traversal.attempts.map((attempt) => ({
+					...attempt,
+					stepArtifactPath: paths.traversalStepsPath,
+				})),
+			})),
+		};
+
+		const previousRun = robot.lastPublishedRunId
+			? await webRobotQueries.getWebRobotRunById(robot.lastPublishedRunId)
+			: null;
+		const report = reconcileCatalogueTrust({
 			runId: run.id,
-			recipe: claimed.definition,
-			definitionHash: claimed.definitionHash,
-			normalized: result.normalized,
-			events: result.events,
-			stats: result.stats,
-			startedAt: claimed.startedAt,
-			completedAt,
+			configurationHash: claimed.configurationHash,
+			scope: claimed.scopeSnapshot,
+			contract: claimed.contractSnapshot,
+			verificationPlan: claimed.verificationPlanSnapshot,
+			sourceAssessment: configuration.sourceAssessment,
+			result: stagedResult,
+			verifiedAt: completedAt,
+			previousSummary: previousRun?.trustSummary ?? null,
 		});
 
-		if (!artifacts.published) {
-			const publishError = artifacts.publishError ?? 'Web robot did not publish its dataset.';
-			logger.warn(`Web robot run ${run.id} was rejected by publish safeguards`, {
+		const blockedStatus = robot.lastPublishedRunId ? 'retained_previous' : 'blocked_initial';
+		const ready = report.summary.status === 'ready';
+
+		let artifactPrefix: string | null = null;
+		let trustReportPath: string | null = null;
+		let trustReportHash: string | null = null;
+		let publicationError: string | null = null;
+		try {
+			const artifacts = await writeWebRobotRunArtifacts({
+				projectId: robot.projectId,
+				robotId: robot.id,
+				robotName: robot.name,
+				robotSlug: robot.slug,
+				runId: run.id,
+				recipe: claimed.definition,
+				definitionHash: claimed.definitionHash,
+				normalized: result.normalized,
+				events: result.events,
+				traversalSteps: result.traversalSteps,
+				trustReport: report,
+				previousPublishedRunId: robot.lastPublishedRunId,
+				stats: result.stats,
+				startedAt: claimed.startedAt,
+				completedAt,
+			});
+			artifactPrefix = artifacts.artifactPrefix;
+			trustReportPath = artifacts.trustReportPath;
+			trustReportHash = artifacts.trustReportHash;
+		} catch (stagingError) {
+			publicationError = stagingError instanceof Error ? stagingError.message : String(stagingError);
+			logger.error(`Web robot run ${run.id} artifact staging failed: ${publicationError}`, {
 				source: 'system',
 				projectId: robot.projectId,
-				context: {
-					robotId: robot.id,
-					runId: run.id,
-					artifactPrefix: artifacts.artifactPrefix,
-					publishError,
-					stats: result.stats,
-				},
+				context: { robotId: robot.id, runId: run.id, error: serializeError(stagingError) },
 			});
-			await webRobotQueries.completeWebRobotRun(
-				run.id,
-				'failed',
-				result.stats,
-				publishError,
-				artifacts.artifactPrefix,
-			);
+			await webRobotQueries.completeWebRobotTrustEvaluation(run.id, {
+				executionStatus: 'succeeded',
+				trustStatus: report.summary.status,
+				trustBasis: report.summary.basis,
+				trustSummary: report.summary,
+				publicationStatus: ready ? 'publication_failed' : blockedStatus,
+				publicationErrorMessage: publicationError,
+				stats: result.stats,
+			});
 			return;
 		}
 
-		const siteChanges = siteChangeSignals(result, robot.lastPublishedProductCount, claimed.definition);
-		result.stats.warnings ??= [];
-		result.stats.warnings.push(...siteChanges);
-		const status =
-			result.stats.extractionErrors + result.stats.failedRequests > 0 || siteChanges.length > 0
-				? 'partial'
-				: 'completed';
-		await webRobotQueries.completeWebRobotRun(
-			run.id,
-			status,
-			result.stats,
-			siteChanges.length ? siteChanges.join(' ') : null,
-			artifacts.artifactPrefix,
-		);
-		await webRobotQueries.markWebRobotPublish(robot.id, run.id, result.normalized.products.length, completedAt);
-		logger.info(`Web robot run ${run.id} finished with status ${status}`, {
+		await webRobotQueries.completeWebRobotTrustEvaluation(run.id, {
+			executionStatus: 'succeeded',
+			trustStatus: report.summary.status,
+			trustBasis: report.summary.basis,
+			trustSummary: report.summary,
+			publicationStatus: ready ? 'pending' : blockedStatus,
+			trustReportPath,
+			trustReportHash,
+			artifactPrefix,
+			stats: result.stats,
+		});
+
+		if (ready) {
+			try {
+				await webRobotQueries.activateWebRobotPublication({
+					robotId: robot.id,
+					runId: run.id,
+					configurationId: configuration.id,
+					productCount: result.normalized.products.length,
+					entityUnit: report.summary.granularity,
+					completedAt,
+				});
+			} catch (activationError) {
+				const message = activationError instanceof Error ? activationError.message : String(activationError);
+				logger.error(`Web robot run ${run.id} publication activation failed: ${message}`, {
+					source: 'system',
+					projectId: robot.projectId,
+					context: { robotId: robot.id, runId: run.id, error: serializeError(activationError) },
+				});
+				await webRobotQueries.markWebRobotPublicationFailed(run.id, message);
+				return;
+			}
+		}
+
+		logger.info(`Web robot run ${run.id} finished`, {
 			source: 'system',
 			projectId: robot.projectId,
 			context: {
 				robotId: robot.id,
 				runId: run.id,
-				status,
-				artifactPrefix: artifacts.artifactPrefix,
-				productCount: result.normalized.products.length,
+				executionStatus: 'succeeded',
+				trustStatus: report.summary.status,
+				trustBasis: report.summary.basis,
+				publicationStatus: ready ? 'published' : blockedStatus,
+				artifactPrefix,
+				entityCount: result.normalized.products.length,
 				stats: result.stats,
 			},
 		});
@@ -142,12 +245,16 @@ export const webRobotRunJob = async (payload: WebRobotJobPayload, job: DBSchedul
 				context: { robotId: robot.id, runId: run.id, error: serializeError(error) },
 			});
 		}
-		await webRobotQueries.completeWebRobotRun(
-			run.id,
-			cancelled ? 'cancelled' : 'failed',
-			latest?.stats ?? emptyWebRobotRunStats(),
-			message,
-		);
+		await webRobotQueries.completeWebRobotTrustEvaluation(run.id, {
+			executionStatus: cancelled ? 'cancelled' : 'failed',
+			trustStatus: null,
+			trustBasis: null,
+			trustSummary: null,
+			publicationStatus: robot.lastPublishedRunId ? 'retained_previous' : 'blocked_initial',
+			executionErrorMessage: message,
+			artifactPrefix: latest?.artifactPrefix ?? null,
+			stats: latest?.stats ?? emptyWebRobotRunStats(),
+		});
 		if (!cancelled) {
 			throw error;
 		}
@@ -156,43 +263,16 @@ export const webRobotRunJob = async (payload: WebRobotJobPayload, job: DBSchedul
 	}
 };
 
-const siteChangeSignals = (
-	result: Awaited<ReturnType<typeof runWebRobotRecipe>>,
-	previousProductCount: number | null,
-	recipe: WebRobotRecipe,
-): string[] => {
-	const signals: string[] = [];
-	const warningKinds = new Set(
-		result.events
-			.filter((event) => event.type === 'warning')
-			.map((event) =>
-				typeof event.data === 'object' && event.data ? (event.data as { kind?: string }).kind : undefined,
-			),
-	);
-	if (warningKinds.has('selector_fallback') || warningKinds.has('pagination_fallback')) {
-		signals.push('Site layout changed; the recipe used fallback selectors.');
-	}
-	if (warningKinds.has('blocker_detected')) {
-		signals.push('Source returned a blocker signal during the run.');
-	}
-	if (warningKinds.has('field_coverage_drop')) {
-		signals.push('Extracted product field coverage dropped below the expected threshold.');
-	}
-	if (warningKinds.has('pagination_stopped')) {
-		signals.push('Pagination stopped on an unexpected target.');
-	}
-	const coverage = result.stats.fieldCoverage ?? {};
-	const extractsSku = recipe.stages.some(
-		(stage) => stage.output === 'product' && stage.extract && 'sku' in stage.extract.fields,
-	);
-	if ((coverage.url ?? 100) < 80 || (coverage.name ?? 100) < 80 || (extractsSku && (coverage.sku ?? 100) < 50)) {
-		signals.push('Extracted product field coverage dropped below the expected threshold.');
-	}
-	const productCount = result.normalized.products.length;
-	if (previousProductCount && previousProductCount > 0 && productCount <= previousProductCount * 0.5) {
-		signals.push(`Product count dropped from ${previousProductCount} to ${productCount}.`);
-	}
-	return [...new Set(signals)];
+const createProgressWriter = (runId: string) => {
+	let lastWriteAt = 0;
+	return async (progress: Record<string, unknown>): Promise<void> => {
+		const now = Date.now();
+		if (now - lastWriteAt < 1_000) {
+			return;
+		}
+		lastWriteAt = now;
+		await webRobotQueries.updateWebRobotRunProgress(runId, progress);
+	};
 };
 
 const createScheduledRun = async (robotId: string, scheduledJobId: string): Promise<DBWebRobotRun> => {
@@ -206,12 +286,14 @@ const createScheduledRun = async (robotId: string, scheduledJobId: string): Prom
 		throw new Error(`Web robot not found: ${robotId}`);
 	}
 
+	const configuration = await webRobotQueries.getActiveWebRobotConfiguration(robotId);
 	return webRobotQueries.createWebRobotRun({
 		robotId,
 		scheduledJobId,
 		trigger: 'schedule',
-		definition: robot.definition,
-		definitionHash: robot.definitionHash,
+		...(configuration
+			? webRobotRunSnapshot(configuration)
+			: { definition: robot.definition, definitionHash: robot.definitionHash }),
 		stats: emptyWebRobotRunStats(),
 	});
 };

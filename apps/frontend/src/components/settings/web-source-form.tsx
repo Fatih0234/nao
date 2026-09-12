@@ -19,6 +19,7 @@ import {
 } from '@/components/settings/web-source-recipe';
 import { WebSourceRecipeEditor } from '@/components/settings/web-source-recipe-editor';
 import { WebSourceTestRecipe } from '@/components/settings/web-source-test-recipe';
+import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from '@/components/ui/accordion';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { ErrorMessage } from '@/components/ui/error-message';
@@ -37,6 +38,8 @@ export function WebSourceForm({
 	isPending,
 	submitError,
 	definitionHash,
+	scheduleLocked = false,
+	recipeLocked = false,
 }: {
 	initial?: WebSourceFormInitial;
 	isCreate: boolean;
@@ -45,6 +48,8 @@ export function WebSourceForm({
 	isPending?: boolean;
 	submitError?: string | null;
 	definitionHash?: string;
+	scheduleLocked?: boolean;
+	recipeLocked?: boolean;
 }) {
 	const [name, setName] = useState(initial?.name ?? '');
 	const [slug, setSlug] = useState(initial?.slug ?? '');
@@ -149,8 +154,8 @@ export function WebSourceForm({
 			name: name.trim(),
 			slug: isCreate ? slug.trim() || undefined : undefined,
 			description: description.trim() || undefined,
-			cron,
-			enabled: cron.trim() ? enabled : true,
+			cron: scheduleLocked ? '' : cron,
+			enabled: scheduleLocked ? false : cron.trim() ? enabled : true,
 			recipe: recipeResult.recipe,
 		});
 	};
@@ -196,11 +201,17 @@ export function WebSourceForm({
 				</Field>
 			</SettingsCard>
 
-			<SettingsCard title='Schedule' description='Choose when this robot refreshes its generated dataset.'>
+			<SettingsCard title='Schedule' description='Choose when this source refreshes its active dataset.'>
+				{scheduleLocked && (
+					<p className='rounded-md border bg-muted/20 p-3 text-sm text-muted-foreground'>
+						Complete a successful first refresh before configuring automatic refreshes.
+					</p>
+				)}
 				<div className='grid gap-4 lg:grid-cols-[14rem_1fr_auto] lg:items-end'>
 					<Field label='Frequency'>
 						<Select
 							value={schedulePreset}
+							disabled={scheduleLocked}
 							onValueChange={(value) => handleSchedulePreset(value as WebSourceSchedulePreset)}
 						>
 							<SelectTrigger size='input'>
@@ -223,12 +234,16 @@ export function WebSourceForm({
 								setSchedulePreset(schedulePresetForCron(event.target.value));
 							}}
 							placeholder='0 2 * * *'
-							disabled={schedulePreset === 'manual'}
+							disabled={scheduleLocked || schedulePreset === 'manual'}
 							className='font-mono'
 						/>
 					</Field>
 					<div className='flex items-center gap-2 pb-0.5'>
-						<Switch checked={enabled} onCheckedChange={setEnabled} disabled={!cron.trim()} />
+						<Switch
+							checked={enabled}
+							onCheckedChange={setEnabled}
+							disabled={scheduleLocked || !cron.trim()}
+						/>
 						<span className='text-sm'>
 							{cron.trim() ? (enabled ? 'Enabled' : 'Paused') : 'Manual only'}
 						</span>
@@ -241,11 +256,12 @@ export function WebSourceForm({
 							value={scheduleText}
 							onChange={(event) => setScheduleText(event.target.value)}
 							placeholder='every weekday at 6am'
+							disabled={scheduleLocked}
 						/>
 						<Button
 							type='button'
 							variant='secondary'
-							disabled={!scheduleText.trim() || parseCron.isPending}
+							disabled={scheduleLocked || !scheduleText.trim() || parseCron.isPending}
 							isLoading={parseCron.isPending}
 							onClick={handleSuggestCron}
 						>
@@ -257,56 +273,86 @@ export function WebSourceForm({
 				</div>
 			</SettingsCard>
 
-			<SettingsCard
-				title='Recipe'
-				description='Versioned loader, extraction, pagination, identity, and publish rules.'
-				action={
-					<div className='flex items-center gap-2'>
-						{definitionHash && <Badge variant='outline'>hash {definitionHash.slice(0, 12)}</Badge>}
-						<Button
-							type='button'
-							variant='ghost-muted'
-							size='sm'
-							onClick={() => importInput.current?.click()}
+			<Accordion type='single' collapsible className='rounded-md border'>
+				<AccordionItem value='advanced' className='border-b-0'>
+					<AccordionTrigger className='px-4'>
+						<span className='grid gap-0.5'>
+							<span>Advanced</span>
+							<span className='text-xs font-normal text-muted-foreground'>
+								Edit technical recipe and inspection tools
+							</span>
+						</span>
+					</AccordionTrigger>
+					<AccordionContent className='grid gap-6 px-4'>
+						<SettingsCard
+							title='Recipe'
+							description='Versioned loader, extraction, pagination, identity, and publish rules.'
+							action={
+								<div className='flex items-center gap-2'>
+									{definitionHash && (
+										<Badge variant='outline'>hash {definitionHash.slice(0, 12)}</Badge>
+									)}
+									<Button
+										type='button'
+										variant='ghost-muted'
+										size='sm'
+										disabled={recipeLocked}
+										onClick={() => importInput.current?.click()}
+									>
+										<Upload className='size-3.5' />
+										Import JSON
+									</Button>
+									<input
+										ref={importInput}
+										type='file'
+										accept='application/json,.json'
+										className='hidden'
+										disabled={recipeLocked}
+										onChange={(event) => void handleImportFile(event.target.files?.[0])}
+									/>
+								</div>
+							}
 						>
-							<Upload className='size-3.5' />
-							Import JSON
-						</Button>
-						<input
-							ref={importInput}
-							type='file'
-							accept='application/json,.json'
-							className='hidden'
-							onChange={(event) => void handleImportFile(event.target.files?.[0])}
-						/>
-					</div>
-				}
-			>
-				<WebSourceRecipeEditor value={recipeText} onChange={setRecipeText} />
-				{summary && (
-					<div className='flex flex-wrap gap-2'>
-						<Badge variant='secondary'>v{recipeResult.recipe?.version}</Badge>
-						<Badge variant='outline'>{summary.stageCount} stages</Badge>
-						{summary.sourceTypes.map((type) => (
-							<Badge key={type} variant='outline'>
-								{type}
-							</Badge>
-						))}
-						{summary.allowedHosts.map((host) => (
-							<Badge key={host} variant='secondary'>
-								{host}
-							</Badge>
-						))}
-					</div>
-				)}
-				{recipeResult.errors.length > 0 && <ErrorMessage message={recipeResult.errors.join('\n')} />}
-			</SettingsCard>
+							{recipeLocked && (
+								<p className='rounded-md border bg-muted/20 p-3 text-sm text-muted-foreground'>
+									Published recipe changes require a repaired configuration and a new quality-checked
+									refresh. Use Repair in refresh history to propose an update.
+								</p>
+							)}
+							<WebSourceRecipeEditor
+								value={recipeText}
+								onChange={setRecipeText}
+								readOnly={recipeLocked}
+							/>
+							{summary && (
+								<div className='flex flex-wrap gap-2'>
+									<Badge variant='secondary'>v{recipeResult.recipe?.version}</Badge>
+									<Badge variant='outline'>{summary.stageCount} stages</Badge>
+									{summary.sourceTypes.map((type) => (
+										<Badge key={type} variant='outline'>
+											{type}
+										</Badge>
+									))}
+									{summary.allowedHosts.map((host) => (
+										<Badge key={host} variant='secondary'>
+											{host}
+										</Badge>
+									))}
+								</div>
+							)}
+							{recipeResult.errors.length > 0 && (
+								<ErrorMessage message={recipeResult.errors.join('\n')} />
+							)}
+						</SettingsCard>
 
-			<WebSourceTestRecipe recipe={recipeResult.recipe} validationErrors={recipeResult.errors} />
-			<WebSourceInspector
-				key={recipeResult.recipe?.stages[0]?.source.url ?? 'no-source'}
-				recipe={recipeResult.recipe}
-			/>
+						<WebSourceTestRecipe recipe={recipeResult.recipe} validationErrors={recipeResult.errors} />
+						<WebSourceInspector
+							key={recipeResult.recipe?.stages[0]?.source.url ?? 'no-source'}
+							recipe={recipeResult.recipe}
+						/>
+					</AccordionContent>
+				</AccordionItem>
+			</Accordion>
 
 			{(submitError || errors.length > 0) && (
 				<ErrorMessage message={[submitError, ...errors].filter(Boolean).join('\n')} />

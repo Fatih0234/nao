@@ -55,6 +55,106 @@ describe('web robot product normalization', () => {
 		expect(normalized.documents[0]?.url).toBe('https://example.com/docs/a-1.pdf');
 	});
 
+	it('separates shared SKUs under v1 composite keys but merges them under v2 first_present', () => {
+		const sharedSkuRecords = [
+			{
+				stageId: 'products',
+				data: { sku: 'A-1', name: 'A', url: 'https://example.com/products/a' },
+			},
+			{
+				stageId: 'products',
+				data: { sku: 'A-1', name: 'A', url: 'https://example.com/products/a?color=red' },
+			},
+		];
+		const v1Recipe = webRobotRecipeSchema.parse({
+			version: 1,
+			allowedHosts: ['example.com'],
+			identity: { fields: ['sku', 'url'] },
+			stages: [
+				{
+					id: 'products',
+					source: { type: 'api', url: 'https://example.com/products' },
+					output: 'product',
+				},
+			],
+		});
+		const v2Recipe = webRobotRecipeSchema.parse({
+			version: 2,
+			allowedHosts: ['example.com'],
+			identity: { strategy: 'first_present', fields: ['sku', 'url'] },
+			stages: [
+				{
+					id: 'products',
+					source: { type: 'api', url: 'https://example.com/products' },
+					output: 'product',
+				},
+			],
+		});
+
+		const v1 = normalizeProducts(sharedSkuRecords, v1Recipe);
+		expect(v1.products).toHaveLength(2);
+		expect(v1.identityMetrics).toMatchObject({
+			totalEntities: 2,
+			configuredFieldUsage: { sku: 2, url: 2 },
+			fallbackUrlCount: 0,
+			recordHashFallbackCount: 0,
+			collisionCount: 0,
+			collisions: [],
+		});
+
+		const v2 = normalizeProducts(sharedSkuRecords, v2Recipe);
+		expect(v2.products).toHaveLength(1);
+		expect(v2.identityMetrics).toMatchObject({
+			totalEntities: 1,
+			configuredFieldUsage: { sku: 2 },
+			fallbackUrlCount: 0,
+			recordHashFallbackCount: 0,
+			collisionCount: 0,
+			collisions: [],
+		});
+	});
+
+	it('counts fallback URL and record hash identities', () => {
+		const urlOnlyRecipe = webRobotRecipeSchema.parse({
+			version: 2,
+			allowedHosts: ['example.com'],
+			identity: { strategy: 'first_present', fields: ['sku'] },
+			stages: [
+				{
+					id: 'products',
+					source: { type: 'api', url: 'https://example.com/products' },
+					output: 'product',
+				},
+			],
+		});
+
+		const normalized = normalizeProducts(
+			[
+				{
+					stageId: 'products',
+					data: { name: 'A', url: 'https://example.com/products/a' },
+				},
+				{
+					stageId: 'products',
+					data: { name: 'B' },
+				},
+			],
+			urlOnlyRecipe,
+		);
+
+		expect(normalized.products).toHaveLength(2);
+		expect(normalized.products.map((product) => product.product_key)).toEqual(
+			expect.arrayContaining([expect.stringMatching(/^url:/), expect.stringMatching(/^record:/)]),
+		);
+		expect(normalized.identityMetrics).toMatchObject({
+			totalEntities: 2,
+			configuredFieldUsage: {},
+			fallbackUrlCount: 1,
+			recordHashFallbackCount: 1,
+			collisionCount: 0,
+		});
+	});
+
 	it('merges repeated records by product key', () => {
 		const normalized = normalizeProducts(
 			[

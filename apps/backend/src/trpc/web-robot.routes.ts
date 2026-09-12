@@ -1,4 +1,13 @@
 import { webRobotBrowserActionSchema, webRobotBrowserCaptureSchema, webRobotRecipeSchema } from '@nao/shared/web-robot';
+import {
+	catalogueConceptLabels,
+	catalogueContractSchema,
+	catalogueScopeSchema,
+	catalogueVerificationPlanSchema,
+	countSignalSchema,
+	scopeEvidenceSchema,
+	scopeFitnessDecisionSchema,
+} from '@nao/shared/web-robot-trust';
 import { TRPCError } from '@trpc/server';
 import { z } from 'zod/v4';
 
@@ -21,6 +30,14 @@ import {
 } from '../services/web-robot';
 import { authorWebRobotRecipeFromUrl } from '../services/web-robot-authoring';
 import { previewWebRobotRepair } from '../services/web-robot-authoring/repair';
+import {
+	BUSINESS_SELECTABLE_CONCEPTS,
+	type BusinessSelectableConcept,
+	catalogueContractWithRequiredConcepts,
+	DEFAULT_BUSINESS_REQUIRED_CONCEPTS,
+	evidenceFilteredDefaultConcepts,
+	savePendingWebRobotConfiguration,
+} from '../services/web-robot-configuration';
 import { inspectWebRobotUrl, runWebRobotRecipe } from '../services/web-scraper';
 import { isAllowedHostname } from '../services/web-scraper/url-policy';
 import { isDatasetPath, toDatasetRelativePath, toDatasetVirtualPath } from '../utils/tools';
@@ -69,7 +86,7 @@ export const webRobotRoutes = {
 	}),
 
 	get: webRobotProcedure.input(z.object({ id: z.string() })).query(async ({ ctx, input }) => {
-		const robot = await webRobotQueries.getWebRobot(ctx.project.id, input.id);
+		const robot = await webRobotQueries.getWebRobotDetail(ctx.project.id, input.id);
 		if (!robot) {
 			throw new TRPCError({ code: 'NOT_FOUND', message: `Web robot not found: ${input.id}` });
 		}
@@ -80,8 +97,26 @@ export const webRobotRoutes = {
 		return createWebRobot(ctx.project.id, ctx.user.id, input);
 	}),
 
+	analyzeUrl: webRobotProcedure.input(z.object({ url: httpUrlSchema.max(4096) })).mutation(async ({ ctx, input }) => {
+		return authorWebRobotRecipeFromUrl({
+			projectId: ctx.project.id,
+			url: input.url,
+			env: await projectQueries.getEnvVars(ctx.project.id),
+		});
+	}),
+
 	createFromUrl: webRobotProcedure
-		.input(z.object({ url: httpUrlSchema.max(4096), name: z.string().trim().min(1).max(255).optional() }))
+		.input(
+			z.object({
+				url: httpUrlSchema.max(4096),
+				name: z.string().trim().min(1).max(255).optional(),
+				requiredConcepts: z
+					.array(z.enum(BUSINESS_SELECTABLE_CONCEPTS))
+					.max(BUSINESS_SELECTABLE_CONCEPTS.length)
+					.optional(),
+				confirmedScope: catalogueScopeSchema.optional(),
+			}),
+		)
 		.mutation(async ({ ctx, input }) => {
 			const authored = await authorWebRobotRecipeFromUrl({
 				projectId: ctx.project.id,
@@ -91,7 +126,18 @@ export const webRobotRoutes = {
 			if (authored.status !== 'ready') {
 				return authored;
 			}
+			if (!input.confirmedScope) {
+				throw new TRPCError({
+					code: 'PRECONDITION_FAILED',
+					message: 'Analyze and confirm the catalogue scope before publishing.',
+				});
+			}
+			const scope = userConfirmedScope(authored.scope, input.confirmedScope);
 
+			const contract = catalogueContractWithRequiredConcepts(
+				authored.contract,
+				input.requiredConcepts ?? evidenceFilteredDefaultConcepts(authored.capabilities),
+			);
 			const name = input.name ?? suggestedRobotName(authored.diagnostics.discovery.title, input.url);
 			const robot = await createWebRobot(ctx.project.id, ctx.user.id, {
 				name,
@@ -101,7 +147,37 @@ export const webRobotRoutes = {
 				cron: '',
 				enabled: false,
 			});
+			await savePendingWebRobotConfiguration({
+				robotId: robot.id,
+				userId: ctx.user.id,
+				recipe: authored.recipe,
+				scope,
+				contract,
+				verificationPlan: authored.verificationPlan,
+				sourceAssessment: authored.sourceAssessment,
+				scopeEvidence: authored.scopeEvidence,
+				countSignals: authored.countSignals,
+			});
 			const warnings = [...authored.warnings];
+			const required = new Set(contract.requiredConcepts.map((entry) => entry.concept));
+			for (const capability of authored.capabilities) {
+				if (capability.status !== 'not_detected') {
+					continue;
+				}
+				const label = catalogueConceptLabels[capability.concept];
+				if (required.has(capability.concept)) {
+					warnings.push(
+						`${label} was not found in the analysed sample; the first refresh may fail this requirement.`,
+					);
+				} else if (
+					input.requiredConcepts === undefined &&
+					DEFAULT_BUSINESS_REQUIRED_CONCEPTS.includes(capability.concept as BusinessSelectableConcept)
+				) {
+					warnings.push(
+						`${label} was not found in the analysed sample and was not added to the requirements.`,
+					);
+				}
+			}
 			const run = await enqueueWebRobotRunNow(ctx.project.id, ctx.user.id, robot.id).catch((error) => {
 				warnings.push(
 					`The source was created, but the initial run could not be queued: ${errorMessage(error)}`,
@@ -114,6 +190,12 @@ export const webRobotRoutes = {
 				run,
 				score: authored.score,
 				recipe: authored.recipe,
+				scope,
+				contract,
+				verificationPlan: authored.verificationPlan,
+				sourceAssessment: authored.sourceAssessment,
+				scopeEvidence: authored.scopeEvidence,
+				countSignals: authored.countSignals,
 				sampleProducts: authored.sampleProducts,
 				warnings,
 				diagnostics: authored.diagnostics,
@@ -266,6 +348,12 @@ export const webRobotRoutes = {
 				id: z.string(),
 				expectedDefinitionHash: z.string().trim().min(1).max(128),
 				recipe: webRobotRecipeSchema,
+				scope: catalogueScopeSchema,
+				contract: catalogueContractSchema,
+				verificationPlan: catalogueVerificationPlanSchema,
+				sourceAssessment: z.array(scopeFitnessDecisionSchema).max(128),
+				scopeEvidence: z.array(scopeEvidenceSchema).max(256),
+				countSignals: z.array(countSignalSchema).max(64),
 			}),
 		)
 		.mutation(async ({ ctx, input }) => {
@@ -278,20 +366,38 @@ export const webRobotRoutes = {
 				});
 			}
 			assertRepairRecipeScope(robot.definition, input.recipe);
-			const updated = await updateWebRobot(ctx.project.id, robot.id, {
-				name: robot.name,
-				description: robot.description ?? undefined,
+			const existingConfiguration =
+				(await webRobotQueries.getPendingWebRobotConfiguration(robot.id)) ??
+				(await webRobotQueries.getActiveWebRobotConfiguration(robot.id));
+			const contract = existingConfiguration
+				? { ...input.contract, requiredConcepts: existingConfiguration.contract.requiredConcepts }
+				: input.contract;
+			const scope = {
+				...input.scope,
+				selection: {
+					...input.scope.selection,
+					mode: 'user_confirmed' as const,
+					confirmedAt: new Date().toISOString(),
+				},
+			};
+			const configuration = await savePendingWebRobotConfiguration({
+				robotId: robot.id,
+				userId: ctx.user.id,
 				recipe: input.recipe,
-				cron: robot.cron ?? '',
-				enabled: robot.enabled,
+				scope,
+				contract,
+				verificationPlan: input.verificationPlan,
+				sourceAssessment: input.sourceAssessment,
+				scopeEvidence: input.scopeEvidence,
+				countSignals: input.countSignals,
 			});
-			if (!updated) {
-				throw new TRPCError({ code: 'NOT_FOUND', message: `Web robot not found: ${input.id}` });
-			}
+			const run = await enqueueWebRobotRunNow(ctx.project.id, ctx.user.id, robot.id);
 			return {
-				robot: updated,
+				robot,
+				configuration,
+				run,
 				previousDefinitionHash: robot.definitionHash,
-				definitionHash: updated.definitionHash,
+				definitionHash: configuration.recipeHash,
 			};
 		}),
 
@@ -401,3 +507,28 @@ const suggestedRobotSlug = (name: string, url: string): string => {
 };
 
 const errorMessage = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+
+const userConfirmedScope = (
+	authored: z.infer<typeof catalogueScopeSchema>,
+	confirmed: z.infer<typeof catalogueScopeSchema>,
+): z.infer<typeof catalogueScopeSchema> => {
+	const { selection: authoredSelection, ...authoredComparable } = authored;
+	const { selection: confirmedSelection, ...confirmedComparable } = confirmed;
+	if (
+		JSON.stringify(authoredComparable) !== JSON.stringify(confirmedComparable) ||
+		authoredSelection.candidateId !== confirmedSelection.candidateId
+	) {
+		throw new TRPCError({
+			code: 'CONFLICT',
+			message: 'The analysed catalogue scope changed. Analyze the source again before publishing.',
+		});
+	}
+	return {
+		...authored,
+		selection: {
+			...authored.selection,
+			mode: 'user_confirmed',
+			confirmedAt: new Date().toISOString(),
+		},
+	};
+};

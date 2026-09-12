@@ -4,7 +4,7 @@ import path from 'path';
 
 import { ListOutput, renderToModelOutput } from '../../components/tool-outputs';
 import { isStorageEnabled } from '../../services/storage';
-import { listProjectDatasetDirectory } from '../../services/storage/project-datasets';
+import { listPublishedProjectDatasetDirectory } from '../../services/storage/project-datasets';
 import { listUserDirectory } from '../../services/storage/user-files';
 import type { ToolContext } from '../../types/tools';
 import {
@@ -53,7 +53,7 @@ const listStorage = async (virtualPath: string, context: ToolContext): Promise<l
 };
 
 const listDatasets = async (virtualPath: string, context: ToolContext): Promise<list.Entry[]> => {
-	const entries = await listProjectDatasetDirectory(context.projectId, toDatasetRelativePath(virtualPath));
+	const entries = await listPublishedProjectDatasetDirectory(context.projectId, toDatasetRelativePath(virtualPath));
 
 	return entries.map((entry) => ({
 		path: toDatasetVirtualPath(entry.relativePath),

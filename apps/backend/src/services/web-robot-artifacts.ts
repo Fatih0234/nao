@@ -3,8 +3,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import type { WebRobotRecipe, WebRobotRunStats } from '@nao/shared/web-robot';
+import type { CatalogueTrustReport, TraversalStepEvidence } from '@nao/shared/web-robot-trust';
 
 import { env } from '../env';
+import * as webRobotQueries from '../queries/web-robot.queries';
 import { toDatasetVirtualPath } from '../utils/tools';
 import { writeJsonLinesAsParquet } from './duckdb.service';
 import { projectDatasetRelativePathFromKey } from './storage/keys';
@@ -16,12 +18,18 @@ import {
 	statProjectDataset,
 	writeProjectDataset,
 } from './storage/project-datasets';
-import { assertPublishAllowed, diffProducts, type ProductDiff } from './web-scraper/diff';
+import {
+	catalogueTrustManifestProjection,
+	catalogueTrustReadme,
+	catalogueTrustReportHash,
+} from './web-robot-trust/report';
+import { diffProducts, type ProductDiff } from './web-scraper/diff';
 import type { NormalizedProducts } from './web-scraper/records';
 import type { WebRobotRunEvent } from './web-scraper/types';
 
-export type PublishWebRobotRunArtifactsInput = {
+export type WriteWebRobotRunArtifactsInput = {
 	projectId: string;
+	robotId: string;
 	robotName: string;
 	robotSlug: string;
 	runId: string;
@@ -29,6 +37,9 @@ export type PublishWebRobotRunArtifactsInput = {
 	definitionHash: string;
 	normalized: NormalizedProducts;
 	events: WebRobotRunEvent[];
+	traversalSteps: TraversalStepEvidence[];
+	trustReport: CatalogueTrustReport;
+	previousPublishedRunId?: string | null;
 	stats: WebRobotRunStats;
 	startedAt?: Date | null;
 	completedAt: Date;
@@ -37,10 +48,18 @@ export type PublishWebRobotRunArtifactsInput = {
 export type WebRobotArtifactResult = {
 	artifactPrefix: string;
 	latestPrefix: string;
+	trustReportPath: string;
+	trustReportHash: string;
+	traversalStepsPath: string;
 	diff: ProductDiff;
-	published: boolean;
-	publishError?: string;
 };
+
+export const webRobotRunArtifactPaths = (robotSlug: string, runId: string) => ({
+	artifactPrefix: toDatasetVirtualPath(`${robotSlug}/versions/${runId}`),
+	latestPrefix: toDatasetVirtualPath(`${robotSlug}/latest`),
+	trustReportPath: toDatasetVirtualPath(`${robotSlug}/versions/${runId}/trust-report.json`),
+	traversalStepsPath: toDatasetVirtualPath(`${robotSlug}/versions/${runId}/traversal-steps.jsonl`),
+});
 
 const PRODUCT_COLUMNS = [
 	'product_key',
@@ -65,12 +84,17 @@ const ATTRIBUTE_COLUMNS = ['product_key', 'name', 'value', 'unit', 'source_url',
 const DOCUMENT_COLUMNS = ['product_key', 'title', 'url', 'document_type', 'run_id'];
 const CHANGE_COLUMNS = ['change_type', 'product_key', 'field', 'old_value', 'new_value', 'run_id'];
 
-export const publishWebRobotRunArtifacts = async (
-	input: PublishWebRobotRunArtifactsInput,
+export const writeWebRobotRunArtifacts = async (
+	input: WriteWebRobotRunArtifactsInput,
 ): Promise<WebRobotArtifactResult> => {
+	const paths = webRobotRunArtifactPaths(input.robotSlug, input.runId);
 	const runPrefix = `${input.robotSlug}/versions/${input.runId}`;
-	const latestPrefix = `${input.robotSlug}/latest`;
-	const previousProducts = await readJsonLines(`${latestPrefix}/products.jsonl`, input.projectId);
+	const previousProducts = input.previousPublishedRunId
+		? await readJsonLines(
+				`${input.robotSlug}/versions/${input.previousPublishedRunId}/products.jsonl`,
+				input.projectId,
+			)
+		: [];
 	const diff = diffProducts(previousProducts, input.normalized.products, input.recipe);
 
 	input.stats.productsAdded = diff.added.length;
@@ -78,39 +102,23 @@ export const publishWebRobotRunArtifacts = async (
 	input.stats.productsRemoved = diff.removed.length;
 	input.stats.productsUnchanged = diff.unchanged.length;
 
-	let published = false;
-	let publishError: string | undefined;
-	try {
-		assertPublishAllowed(diff, input.normalized.products, input.recipe);
-		published = true;
-	} catch (error) {
-		publishError = error instanceof Error ? error.message : String(error);
-		input.stats.errors.push(publishError);
-	}
-
-	const files = await buildArtifactFiles(input, diff, published, publishError);
+	const files = await buildArtifactFiles(input, diff, paths);
 	await writeFiles(input.projectId, runPrefix, files);
-	if (published) {
-		await writeFiles(input.projectId, latestPrefix, files);
-	}
-	await cleanupArtifactVersions(input.projectId, input.robotSlug).catch((error) => {
+	await cleanupArtifactVersions(input.projectId, input.robotId, input.robotSlug, input.runId).catch((error) => {
 		input.stats.errors.push(`Artifact cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
 	});
 
 	return {
-		artifactPrefix: toDatasetVirtualPath(runPrefix),
-		latestPrefix: toDatasetVirtualPath(latestPrefix),
+		...paths,
+		trustReportHash: catalogueTrustReportHash(input.trustReport),
 		diff,
-		published,
-		publishError,
 	};
 };
 
 const buildArtifactFiles = async (
-	input: PublishWebRobotRunArtifactsInput,
+	input: WriteWebRobotRunArtifactsInput,
 	diff: ProductDiff,
-	published: boolean,
-	publishError?: string,
+	paths: ReturnType<typeof webRobotRunArtifactPaths>,
 ): Promise<Map<string, Buffer>> => {
 	const files = new Map<string, Buffer>();
 	const changes = diff.changes.map((change) => ({ ...change, run_id: input.runId }));
@@ -132,8 +140,10 @@ const buildArtifactFiles = async (
 		'errors.jsonl',
 		Buffer.from(toJsonLines(input.events.filter((event) => event.type === 'error')), 'utf-8'),
 	);
+	files.set('traversal-steps.jsonl', Buffer.from(toJsonLines(input.traversalSteps), 'utf-8'));
+	files.set('trust-report.json', Buffer.from(JSON.stringify(input.trustReport, null, 2), 'utf-8'));
 	files.set('schema.json', Buffer.from(JSON.stringify(datasetSchema(input), null, 2), 'utf-8'));
-	files.set('README.md', Buffer.from(datasetReadme(input, diff, published, publishError), 'utf-8'));
+	files.set('README.md', Buffer.from(datasetReadme(input, paths), 'utf-8'));
 	files.set(
 		'manifest.json',
 		Buffer.from(
@@ -142,8 +152,6 @@ const buildArtifactFiles = async (
 					runId: input.runId,
 					robotSlug: input.robotSlug,
 					definitionHash: input.definitionHash,
-					published,
-					publishError,
 					startedAt: input.startedAt?.toISOString() ?? null,
 					completedAt: input.completedAt.toISOString(),
 					counts: {
@@ -154,6 +162,11 @@ const buildArtifactFiles = async (
 					},
 					stats: input.stats,
 					paths: datasetPaths(input.robotSlug),
+					trust: {
+						...catalogueTrustManifestProjection(input.trustReport),
+						trustReportPath: paths.trustReportPath,
+						traversalStepsPath: paths.traversalStepsPath,
+					},
 				},
 				null,
 				2,
@@ -171,16 +184,26 @@ const writeFiles = async (projectId: string, prefix: string, files: Map<string, 
 	}
 };
 
-const cleanupArtifactVersions = async (projectId: string, robotSlug: string): Promise<void> => {
+const cleanupArtifactVersions = async (
+	projectId: string,
+	robotId: string,
+	robotSlug: string,
+	currentRunId: string,
+): Promise<void> => {
 	const versionsPrefix = `${robotSlug}/versions`;
 	const entries = await listProjectDatasetDirectory(projectId, versionsPrefix);
 	const directories = entries.filter((entry) => entry.type === 'directory');
-	if (directories.length <= env.WEB_ROBOT_ARTIFACT_RETENTION_RUNS) {
+	const protectedIds = new Set([
+		currentRunId,
+		...(await webRobotQueries.listProtectedWebRobotArtifactRunIds(robotId)),
+	]);
+	const unprotected = directories.filter((entry) => !protectedIds.has(entry.name));
+	if (unprotected.length <= env.WEB_ROBOT_ARTIFACT_RETENTION_RUNS) {
 		return;
 	}
 
 	const versions = await Promise.all(
-		directories.map(async (entry) => ({
+		unprotected.map(async (entry) => ({
 			path: entry.relativePath,
 			completedAt: await artifactCompletedAt(projectId, `${entry.relativePath}/manifest.json`),
 		})),
@@ -254,7 +277,7 @@ const datasetPaths = (slug: string) => ({
 	changes: toDatasetVirtualPath(`${slug}/latest/changes.parquet`),
 });
 
-const datasetSchema = (input: PublishWebRobotRunArtifactsInput) => ({
+const datasetSchema = (input: WriteWebRobotRunArtifactsInput) => ({
 	name: input.robotName,
 	slug: input.robotSlug,
 	tables: {
@@ -266,39 +289,11 @@ const datasetSchema = (input: PublishWebRobotRunArtifactsInput) => ({
 });
 
 const datasetReadme = (
-	input: PublishWebRobotRunArtifactsInput,
-	diff: ProductDiff,
-	published: boolean,
-	publishError?: string,
-): string => {
-	const paths = datasetPaths(input.robotSlug);
-	return `# ${input.robotName}
-
-Generated web catalogue dataset.
-
-- Slug: \`${input.robotSlug}\`
-- Last run: \`${input.runId}\`
-- Published: ${published ? 'yes' : 'no'}${publishError ? ` (${publishError})` : ''}
-- Products: ${input.normalized.products.length}
-- Added: ${diff.added.length}
-- Changed: ${diff.changed.length}
-- Removed: ${diff.removed.length}
-- Completed: ${input.completedAt.toISOString()}
-
-## Files
-
-- \`${paths.products}\` — one row per product
-- \`${paths.productAttributes}\` — normalized product attribute rows
-- \`${paths.productDocuments}\` — linked product documents
-- \`${paths.changes}\` — product changes detected by this run
-- \`${paths.manifest}\` — run metadata and counts
-
-## Example
-
-\`\`\`sql
-SELECT product_key, name, sku, canonical_url
-FROM read_parquet('${paths.products}')
-LIMIT 20;
-\`\`\`
-`;
-};
+	input: WriteWebRobotRunArtifactsInput,
+	paths: ReturnType<typeof webRobotRunArtifactPaths>,
+): string =>
+	catalogueTrustReadme(input.trustReport, [
+		...Object.values(datasetPaths(input.robotSlug)),
+		paths.trustReportPath,
+		paths.traversalStepsPath,
+	]);

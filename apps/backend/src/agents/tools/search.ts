@@ -6,7 +6,7 @@ import path from 'path';
 
 import { renderToModelOutput, SearchOutput } from '../../components/tool-outputs';
 import { isStorageEnabled, projectDatasetRelativePathFromKey, relativePathFromKey } from '../../services/storage';
-import { findProjectDatasetFiles } from '../../services/storage/project-datasets';
+import { findPublishedProjectDatasetFiles } from '../../services/storage/project-datasets';
 import { findUserFiles } from '../../services/storage/user-files';
 import type { ToolContext } from '../../types/tools';
 import {
@@ -74,7 +74,7 @@ const searchDatasets = async (recursivePattern: string, context: ToolContext): P
 		return [];
 	}
 
-	const objects = await findProjectDatasetFiles(context.projectId, (relativePath) =>
+	const objects = await findPublishedProjectDatasetFiles(context.projectId, (relativePath) =>
 		minimatch(`${DATASET_MOUNT}/${relativePath}`, recursivePattern, { dot: true }),
 	);
 

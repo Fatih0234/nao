@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { webRobotRecipeSchema } from '../src/web-robot';
+import { webRobotRecipeSchema, webRobotRecipeV1Schema, webRobotRecipeV2Schema } from '../src/web-robot';
 
 const minimalRecipe = {
 	version: 1,
@@ -139,6 +139,36 @@ describe('webRobotRecipeSchema', () => {
 			offsetVariable: 'offset',
 			firstOffset: 0,
 			pageSize: 50,
+		});
+	});
+
+	it('accepts a declared item total path on page pagination', () => {
+		const recipe = webRobotRecipeSchema.parse({
+			version: 1,
+			allowedHosts: ['api.example.com'],
+			stages: [
+				{
+					id: 'products',
+					source: {
+						type: 'api',
+						url: 'https://api.example.com/products',
+						query: { page: '{{page}}' },
+					},
+					paginate: {
+						type: 'page',
+						totalPagesPath: 'numberOfPages',
+						totalItemsPath: 'totalNumberOfResults',
+					},
+					extract: { type: 'json', itemsPath: 'items', fields: { url: { path: 'url' } } },
+					output: 'product',
+				},
+			],
+		});
+
+		expect(recipe.stages[0]?.paginate).toMatchObject({
+			type: 'page',
+			totalPagesPath: 'numberOfPages',
+			totalItemsPath: 'totalNumberOfResults',
 		});
 	});
 
@@ -344,6 +374,36 @@ describe('webRobotRecipeSchema', () => {
 			...minimalRecipe,
 			allowedHosts: ['localhost'],
 		});
+
+		expect(result.success).toBe(false);
+	});
+
+	it('keeps v1 identity defaults unchanged', () => {
+		const recipe = webRobotRecipeV1Schema.parse(minimalRecipe);
+
+		expect(recipe.version).toBe(1);
+		expect(recipe.identity).toEqual({ fields: ['sku', 'url'] });
+	});
+
+	it('accepts v2 recipes and defaults to first_present identity', () => {
+		const recipe = webRobotRecipeV2Schema.parse({ ...minimalRecipe, version: 2 });
+
+		expect(recipe.version).toBe(2);
+		expect(recipe.identity).toEqual({ strategy: 'first_present', fields: ['sku', 'url'] });
+	});
+
+	it('rejects malformed v2 identity strategies', () => {
+		const result = webRobotRecipeSchema.safeParse({
+			...minimalRecipe,
+			version: 2,
+			identity: { strategy: 'all_present', fields: ['sku'] },
+		});
+
+		expect(result.success).toBe(false);
+	});
+
+	it('rejects unsupported recipe versions', () => {
+		const result = webRobotRecipeSchema.safeParse({ ...minimalRecipe, version: 3 });
 
 		expect(result.success).toBe(false);
 	});

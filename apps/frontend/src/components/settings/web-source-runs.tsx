@@ -3,7 +3,17 @@ import { Check, Copy, List, Wrench, X } from 'lucide-react';
 import { useState } from 'react';
 
 import type { WebRobotRun } from '@/components/settings/web-source-recipe';
-import { formatDateTime, formatDuration, webRobotRunBadgeVariant } from '@/components/settings/web-source-recipe';
+import {
+	catalogueExecutionLabel,
+	catalogueGranularityLabel,
+	cataloguePublicationStatusLabel,
+	catalogueTrustBasisLabel,
+	catalogueTrustStatusLabel,
+	formatDateTime,
+	formatDuration,
+	webRobotRunBadgeVariant,
+	webRobotTriggerLabel,
+} from '@/components/settings/web-source-recipe';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Empty } from '@/components/ui/empty';
@@ -31,24 +41,24 @@ export function WebSourceRuns({
 }) {
 	return (
 		<SettingsCard
-			title='Run history'
-			description='Recent scheduled and manual executions, including change counts and artifact paths.'
+			title='Refresh history'
+			description='Manual and scheduled refreshes, quality results, changes, and diagnostic artifacts.'
 			flush
 		>
 			{runs.length === 0 ? (
-				<Empty className='p-8'>No runs yet.</Empty>
+				<Empty className='p-8'>No refreshes yet.</Empty>
 			) : (
 				<Table>
 					<TableHeader>
 						<TableRow>
-							<TableHead>Status</TableHead>
-							<TableHead>Trigger</TableHead>
-							<TableHead>Queued</TableHead>
+							<TableHead>Result</TableHead>
+							<TableHead>Started by</TableHead>
+							<TableHead>Requested</TableHead>
 							<TableHead>Duration</TableHead>
-							<TableHead>Extracted</TableHead>
+							<TableHead>Products found</TableHead>
 							<TableHead>Changes</TableHead>
-							<TableHead>Errors</TableHead>
-							<TableHead>Artifacts</TableHead>
+							<TableHead>Issues</TableHead>
+							<TableHead>Output</TableHead>
 							<TableHead className='w-0' />
 						</TableRow>
 					</TableHeader>
@@ -96,18 +106,31 @@ function WebSourceRunRow({
 	const warnings = stats.warnings ?? [];
 	const coverage = Object.entries(stats.fieldCoverage ?? {});
 	const repairPreview = previewRepair.data;
-	const repairRecipe = repairPreview && 'recipe' in repairPreview ? repairPreview.recipe : undefined;
+	const repairConfiguration =
+		repairPreview && 'scope' in repairPreview && 'recipe' in repairPreview && repairPreview.recipe
+			? repairPreview
+			: undefined;
+	const runError = run.executionErrorMessage ?? run.publicationErrorMessage ?? run.errorMessage;
+	const trustSummary = run.trustSummary;
 
 	return (
 		<>
 			<TableRow>
 				<TableCell>
-					<div className='flex items-center gap-2'>
-						<Badge variant={webRobotRunBadgeVariant(run.status)}>{run.status}</Badge>
-						{run.cancelRequestedAt && canCancel && <Badge variant='outline'>cancelling</Badge>}
+					<div className='flex flex-wrap items-center gap-1'>
+						<Badge variant={webRobotRunBadgeVariant(run.status)}>
+							{catalogueExecutionLabel(run.executionStatus)}
+						</Badge>
+						{run.trustStatus && (
+							<Badge variant='outline'>{catalogueTrustStatusLabel(run.trustStatus)}</Badge>
+						)}
+						{run.publicationStatus && run.publicationStatus !== 'not_evaluated' && (
+							<Badge variant='outline'>{cataloguePublicationStatusLabel(run.publicationStatus)}</Badge>
+						)}
+						{run.cancelRequestedAt && canCancel && <Badge variant='outline'>Cancelling</Badge>}
 					</div>
 				</TableCell>
-				<TableCell>{run.trigger}</TableCell>
+				<TableCell>{webRobotTriggerLabel(run.trigger)}</TableCell>
 				<TableCell>{formatDateTime(run.queuedAt)}</TableCell>
 				<TableCell>{formatDuration(run.startedAt, run.completedAt)}</TableCell>
 				<TableCell>{stats.itemsExtracted}</TableCell>
@@ -121,9 +144,9 @@ function WebSourceRunRow({
 					</span>
 				</TableCell>
 				<TableCell>
-					{run.errorMessage ? (
-						<span className='block max-w-52 truncate text-xs text-destructive' title={run.errorMessage}>
-							{run.errorMessage}
+					{runError ? (
+						<span className='block max-w-52 truncate text-xs text-destructive' title={runError}>
+							{runError}
 						</span>
 					) : (
 						<span className='text-xs text-muted-foreground' title={warnings.join('\n')}>
@@ -190,7 +213,7 @@ function WebSourceRunRow({
 								onClick={() => onCancelRun(run)}
 							>
 								<X className='size-3.5' />
-								Cancel
+								Cancel refresh
 							</Button>
 						)}
 					</div>
@@ -238,7 +261,7 @@ function WebSourceRunRow({
 												))}
 											</div>
 										)}
-										{repairRecipe && (
+										{repairConfiguration && (
 											<Button
 												type='button'
 												variant='secondary'
@@ -249,17 +272,111 @@ function WebSourceRunRow({
 													await applyRepair.mutateAsync({
 														id: robotId,
 														expectedDefinitionHash: definitionHash,
-														recipe: repairRecipe,
+														recipe: repairConfiguration.recipe,
+														scope: repairConfiguration.scope,
+														contract: repairConfiguration.contract,
+														verificationPlan: repairConfiguration.verificationPlan,
+														sourceAssessment: repairConfiguration.sourceAssessment,
+														scopeEvidence: repairConfiguration.scopeEvidence,
+														countSignals: repairConfiguration.countSignals,
 													});
 													await onRepairApplied();
 												}}
 											>
-												Apply repaired recipe
+												Apply repair and retry
 											</Button>
 										)}
 									</>
 								)}
 								{applyRepair.error && <ErrorMessage message={applyRepair.error.message} />}
+							</div>
+						)}
+						{(trustSummary ||
+							run.trustReportPath ||
+							run.executionErrorMessage ||
+							run.publicationErrorMessage) && (
+							<div className='grid gap-2 border-b p-4 text-xs'>
+								{trustSummary && (
+									<>
+										<div className='flex flex-wrap items-center gap-2'>
+											<Badge
+												variant={trustSummary.status === 'ready' ? 'success' : 'context_admin'}
+											>
+												{catalogueTrustStatusLabel(trustSummary.status)}
+											</Badge>
+											<span className='text-muted-foreground'>
+												{trustSummary.entityCount}{' '}
+												{catalogueGranularityLabel(trustSummary.granularity)} ·{' '}
+												{catalogueTrustBasisLabel(trustSummary.basis)} · checked{' '}
+												{formatDateTime(trustSummary.verifiedAt)}
+											</span>
+										</div>
+										<div className='flex flex-wrap gap-2'>
+											{(
+												[
+													['scope', 'Scope'],
+													['records', 'Records'],
+													['identity', 'Identity'],
+													['semantics', 'Required product data'],
+													['freshness', 'Freshness'],
+												] as const
+											).map(([key, label]) => {
+												const dimension = trustSummary.dimensions[key];
+												return (
+													<Badge
+														key={key}
+														variant={
+															dimension.status === 'passed'
+																? 'success'
+																: dimension.status === 'failed'
+																	? 'destructive'
+																	: 'outline'
+														}
+														title={dimension.reasons.join('\n')}
+													>
+														{label}: {dimension.status}
+													</Badge>
+												);
+											})}
+										</div>
+										{trustSummary.requiredCoverage.length > 0 && (
+											<div className='flex flex-wrap gap-2'>
+												{trustSummary.requiredCoverage.map((metric) => (
+													<Badge
+														key={metric.concept}
+														variant={
+															metric.coverage >= metric.minimumCoverage
+																? 'success'
+																: 'destructive'
+														}
+													>
+														{metric.concept} {Math.round(metric.coverage * 100)}% (min{' '}
+														{Math.round(metric.minimumCoverage * 100)}%)
+													</Badge>
+												))}
+											</div>
+										)}
+										{trustSummary.limitations.map((limitation) => (
+											<div key={limitation} className='text-muted-foreground'>
+												{limitation}
+											</div>
+										))}
+										{trustSummary.blockerCodes.map((code) => (
+											<div key={code} className='text-destructive'>
+												{code}
+											</div>
+										))}
+									</>
+								)}
+								{run.executionErrorMessage && (
+									<div className='text-destructive'>{run.executionErrorMessage}</div>
+								)}
+								{run.publicationErrorMessage && (
+									<div className='text-destructive'>{run.publicationErrorMessage}</div>
+								)}
+								{run.trustReportPath && (
+									<div className='font-mono text-muted-foreground'>{run.trustReportPath}</div>
+								)}
 							</div>
 						)}
 						{(coverage.length > 0 || warnings.length > 0) && (
@@ -306,24 +423,39 @@ function WebSourceRunArtifacts({ runId }: { runId: string }) {
 	}
 
 	const manifest = artifacts.data.manifest as {
-		published?: boolean;
-		publishError?: string;
 		counts?: { products?: number; attributes?: number; documents?: number; changes?: number };
+		trust?: {
+			trustSummary?: WebRobotRun['trustSummary'];
+			trustReportHash?: string;
+			trustReportPath?: string;
+			traversalStepsPath?: string;
+		};
 	} | null;
+	const manifestSummary = manifest?.trust?.trustSummary;
 	return (
 		<div className='grid gap-3 p-4'>
 			{manifest && (
 				<div className='flex flex-wrap items-center gap-2 text-xs'>
-					<Badge variant={manifest.published ? 'success' : 'outline'}>
-						{manifest.published ? 'published' : 'not published'}
-					</Badge>
+					{manifestSummary && (
+						<>
+							<Badge variant={manifestSummary.status === 'ready' ? 'success' : 'context_admin'}>
+								{catalogueTrustStatusLabel(manifestSummary.status)}
+							</Badge>
+							<span className='text-muted-foreground'>
+								{manifestSummary.entityCount} {catalogueGranularityLabel(manifestSummary.granularity)} ·{' '}
+								{catalogueTrustBasisLabel(manifestSummary.basis)}
+							</span>
+						</>
+					)}
 					{manifest.counts && (
 						<span className='text-muted-foreground'>
 							{manifest.counts.products} products · {manifest.counts.attributes} attributes ·{' '}
 							{manifest.counts.documents} documents · {manifest.counts.changes} changes
 						</span>
 					)}
-					{manifest.publishError && <span className='text-destructive'>{manifest.publishError}</span>}
+					{manifest.trust?.trustReportPath && (
+						<span className='font-mono text-muted-foreground'>{manifest.trust.trustReportPath}</span>
+					)}
 				</div>
 			)}
 			<div className='grid gap-1 font-mono text-xs'>

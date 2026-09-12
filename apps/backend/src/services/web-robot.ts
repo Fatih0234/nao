@@ -2,7 +2,7 @@ import { emptyWebRobotRunStats, type WebRobotRecipe, webRobotRecipeSchema } from
 import { TRPCError } from '@trpc/server';
 import { CronExpressionParser } from 'cron-parser';
 
-import type { DBWebRobotRun } from '../db/abstractSchema';
+import type { DBWebRobotConfiguration, DBWebRobotRun, NewWebRobotRun } from '../db/abstractSchema';
 import { WEB_ROBOT_JOB_NAME, webRobotJobUniqueKey } from '../handlers/web-robot.handler';
 import * as scheduledJobQueries from '../queries/scheduled-job.queries';
 import type { WebRobotWithSchedule } from '../queries/web-robot.queries';
@@ -19,6 +19,8 @@ export type CreateWebRobotInput = {
 	enabled?: boolean;
 };
 
+const SCHEDULE_REQUIRES_PUBLISHED_MESSAGE = 'Publish a verified dataset before configuring a refresh schedule.';
+
 export const createWebRobot = async (
 	projectId: string,
 	userId: string,
@@ -26,6 +28,9 @@ export const createWebRobot = async (
 ): Promise<WebRobotWithSchedule> => {
 	const cron = input.cron ?? '';
 	assertValidCron(cron);
+	if (cron.trim()) {
+		throw new TRPCError({ code: 'PRECONDITION_FAILED', message: SCHEDULE_REQUIRES_PUBLISHED_MESSAGE });
+	}
 	const slug = input.slug ?? slugifyWebRobotName(input.name);
 	const recipe = webRobotRecipeSchema.parse(input.recipe);
 	const robot = await webRobotQueries
@@ -55,6 +60,10 @@ export const updateWebRobot = async (
 ): Promise<WebRobotWithSchedule | null> => {
 	const cron = input.cron ?? '';
 	assertValidCron(cron);
+	const current = await webRobotQueries.getWebRobot(projectId, id);
+	if (cron.trim() && current && !current.lastPublishedRunId) {
+		throw new TRPCError({ code: 'PRECONDITION_FAILED', message: SCHEDULE_REQUIRES_PUBLISHED_MESSAGE });
+	}
 	const recipe = webRobotRecipeSchema.parse(input.recipe);
 	const robot = await webRobotQueries.updateWebRobot(projectId, id, {
 		name: input.name,
@@ -65,6 +74,27 @@ export const updateWebRobot = async (
 	});
 	return robot ? syncWebRobotSchedule(robot.id, cron, input.enabled ?? true) : null;
 };
+
+export const webRobotRunSnapshot = (
+	configuration: DBWebRobotConfiguration,
+): Pick<
+	NewWebRobotRun,
+	| 'definition'
+	| 'definitionHash'
+	| 'configurationId'
+	| 'configurationHash'
+	| 'scopeSnapshot'
+	| 'contractSnapshot'
+	| 'verificationPlanSnapshot'
+> => ({
+	definition: configuration.recipe,
+	definitionHash: configuration.recipeHash,
+	configurationId: configuration.id,
+	configurationHash: configuration.configurationHash,
+	scopeSnapshot: configuration.scope,
+	contractSnapshot: configuration.contract,
+	verificationPlanSnapshot: configuration.verificationPlan,
+});
 
 export const enqueueWebRobotRunNow = async (
 	projectId: string,
@@ -80,12 +110,16 @@ export const enqueueWebRobotRunNow = async (
 		throw new TRPCError({ code: 'CONFLICT', message: 'This web robot already has an active run.' });
 	}
 
+	const configuration =
+		(await webRobotQueries.getPendingWebRobotConfiguration(robot.id)) ??
+		(await webRobotQueries.getActiveWebRobotConfiguration(robot.id));
 	const run = await webRobotQueries.createWebRobotRun({
 		robotId: robot.id,
 		triggeredByUserId: userId,
 		trigger: 'manual',
-		definition: robot.definition,
-		definitionHash: robot.definitionHash,
+		...(configuration
+			? webRobotRunSnapshot(configuration)
+			: { definition: robot.definition, definitionHash: robot.definitionHash }),
 		stats: emptyWebRobotRunStats(),
 	});
 	const job = await scheduledJobQueries.enqueueOnceJob({
@@ -112,6 +146,12 @@ export const syncWebRobotSchedule = async (
 	enabled: boolean,
 ): Promise<WebRobotWithSchedule> => {
 	const trimmedCron = cron.trim();
+	if (trimmedCron) {
+		const robot = await webRobotQueries.getWebRobotById(robotId);
+		if (robot && !robot.lastPublishedRunId) {
+			throw new TRPCError({ code: 'PRECONDITION_FAILED', message: SCHEDULE_REQUIRES_PUBLISHED_MESSAGE });
+		}
+	}
 	if (!trimmedCron) {
 		const robot = await webRobotQueries.getWebRobotById(robotId);
 		if (robot?.scheduledJobId) {

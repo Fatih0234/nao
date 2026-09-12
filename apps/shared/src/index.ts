@@ -20,3 +20,4 @@ export * from './sql-template';
 export * from './types';
 export * from './utils';
 export * from './web-robot';
+export * from './web-robot-trust';

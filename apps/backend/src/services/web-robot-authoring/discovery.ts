@@ -11,15 +11,19 @@ import { fetchRobotsTxt, RobotsTxtPolicy } from '../web-scraper/robots-txt';
 import { getPathValue } from '../web-scraper/template';
 import type { WebRobotLoadedSource, WebRobotSourceBlocker } from '../web-scraper/types';
 import { assertPublicHttpUrl, canonicalHttpUrl, normalizeHttpUrl } from '../web-scraper/url-policy';
+import { AuthoringRequestPolicy } from './request-policy';
+import { hasProductDiscriminator } from './scope-evidence';
 import type {
 	WebRobotApiCandidate,
 	WebRobotBrowserActionCandidate,
 	WebRobotDetailCandidate,
+	WebRobotDisplayedCount,
 	WebRobotDomCandidate,
 	WebRobotEmbeddedCandidate,
 	WebRobotEndpointCandidate,
 	WebRobotJsonFieldMap,
 	WebRobotJsonLdCandidate,
+	WebRobotPageContext,
 	WebRobotPaginationCandidate,
 	WebRobotSourceDiscovery,
 } from './types';
@@ -41,6 +45,7 @@ const NAME_FIELD_PATTERN = /(name|title|label|display_?name|product_?name)/i;
 type DiscoveryOptions = {
 	url: string;
 	env: Record<string, string>;
+	requestPolicy?: AuthoringRequestPolicy;
 };
 
 type LoadedPage = {
@@ -49,24 +54,34 @@ type LoadedPage = {
 };
 
 export const discoverWebRobotSource = async (options: DiscoveryOptions): Promise<WebRobotSourceDiscovery> => {
-	const destination = await resolveDestination(options.url);
+	const policy = options.requestPolicy ?? new AuthoringRequestPolicy();
+	const destination = await resolveDestination(options.url, policy);
 	const recipe = inspectionRecipe(destination.allowedHosts);
 	const robots = new RobotsTxtPolicy(fetchRobotsTxt);
 	const warnings: string[] = [];
 	const errors: string[] = [];
 
-	const httpLoaded = await loadHttp(destination.url, recipe, options.env, robots);
+	const httpLoaded = await loadHttp(destination.url, recipe, options.env, robots, policy);
 
 	const httpPage = { loaded: httpLoaded, loader: 'http' as const };
 	const discovery = emptyDiscovery(options.url, destination.url, destination.allowedHosts, httpLoaded.status);
 	const probedResources = new Set<string>();
 	analyzeLoadedPage(httpPage, discovery);
-	await discoverReferencedEndpoints(httpLoaded, recipe, options.env, robots, discovery, warnings, probedResources);
+	await discoverReferencedEndpoints(
+		httpLoaded,
+		recipe,
+		options.env,
+		robots,
+		policy,
+		discovery,
+		warnings,
+		probedResources,
+	);
 
-	if (shouldInspectWithBrowser(discovery) && looksLikeHtml(httpLoaded)) {
+	if (!policy.rateLimited && shouldInspectWithBrowser(discovery) && looksLikeHtml(httpLoaded)) {
 		let browser: WebRobotBrowserSession | undefined;
 		try {
-			const inspection = await loadBrowser(destination.url, recipe, options.env, robots);
+			const inspection = await loadBrowser(destination.url, recipe, options.env, robots, policy);
 			browser = inspection.browser;
 			discovery.browserStatus = inspection.loaded.status;
 			analyzeLoadedPage({ loaded: inspection.loaded, loader: 'browser' }, discovery);
@@ -75,12 +90,15 @@ export const discoverWebRobotSource = async (options: DiscoveryOptions): Promise
 				recipe,
 				options.env,
 				robots,
+				policy,
 				discovery,
 				warnings,
 				probedResources,
 			);
 			try {
-				await observeBrowserPagination(browser, destination.url, recipe, options.env, discovery);
+				if (!policy.rateLimited) {
+					await observeBrowserPagination(browser, destination.url, recipe, options.env, discovery, policy);
+				}
 			} catch (error) {
 				warnings.push(`Browser interaction observation failed: ${errorMessage(error)}`);
 			}
@@ -91,14 +109,19 @@ export const discoverWebRobotSource = async (options: DiscoveryOptions): Promise
 		}
 	}
 
-	discovery.detailCandidates = await inspectDetailCandidates(
-		recipe,
-		options.env,
-		robots,
-		destination.allowedHosts,
-		collectProductUrls(discovery),
-		warnings,
-	);
+	if (policy.rateLimited) {
+		addRateLimitBlocker(discovery);
+	} else {
+		discovery.detailCandidates = await inspectDetailCandidates(
+			recipe,
+			options.env,
+			robots,
+			policy,
+			destination.allowedHosts,
+			collectProductUrls(discovery),
+			warnings,
+		);
+	}
 	discovery.warnings.push(...warnings);
 	discovery.errors.push(...errors);
 	return discovery;
@@ -121,6 +144,13 @@ const emptyDiscovery = (
 	domCandidates: [],
 	detailCandidates: [],
 	paginationCandidates: [],
+	pageContext: {
+		headings: [],
+		breadcrumbs: [],
+		activeFilters: filtersFromUrl(finalUrl),
+		...(searchTermFromUrl(finalUrl) ? { searchTerm: searchTermFromUrl(finalUrl) } : {}),
+		displayedCounts: [],
+	},
 	browserActionCandidates: [],
 	blockers: [],
 	warnings: [],
@@ -150,17 +180,22 @@ const inspectionRecipe = (allowedHosts: string[]): WebRobotRecipe => ({
 	],
 });
 
-const resolveDestination = async (inputUrl: string): Promise<{ url: string; allowedHosts: string[] }> => {
+const resolveDestination = async (
+	inputUrl: string,
+	policy: AuthoringRequestPolicy,
+): Promise<{ url: string; allowedHosts: string[] }> => {
 	let current = normalizeHttpUrl(inputUrl);
 	const hosts = new Set([current.hostname]);
 
 	for (let redirectCount = 0; redirectCount <= 5; redirectCount += 1) {
 		await assertPublicHttpUrl(current.toString(), [current.hostname]);
+		await policy.beforeRequest(current.toString());
 		const response = await fetch(current, {
 			method: 'GET',
 			redirect: 'manual',
 			signal: AbortSignal.timeout(15_000),
 		});
+		policy.observeResponse(current.toString(), response);
 		await response.body?.cancel().catch(() => undefined);
 		if (![301, 302, 303, 307, 308].includes(response.status)) {
 			return { url: current.toString(), allowedHosts: [...hosts] };
@@ -191,11 +226,17 @@ const loadHttp = async (
 	recipe: WebRobotRecipe,
 	env: Record<string, string>,
 	robots: RobotsTxtPolicy,
+	policy: AuthoringRequestPolicy,
 ): Promise<WebRobotLoadedSource> => {
 	if (recipe.respectRobotsTxt) {
 		await robots.assertAllowed(url);
 	}
-	return loadHttpSource({ type: 'http', url, method: 'GET', headers: {} }, { recipe, scope: {}, env });
+	const loaded = await loadHttpSource(
+		{ type: 'http', url, method: 'GET', headers: {} },
+		{ recipe, scope: {}, env, requestPolicy: policy },
+	);
+	policy.remember(url, loaded);
+	return loaded;
 };
 
 const loadBrowser = async (
@@ -203,16 +244,17 @@ const loadBrowser = async (
 	recipe: WebRobotRecipe,
 	env: Record<string, string>,
 	robots: RobotsTxtPolicy,
+	policy: AuthoringRequestPolicy,
 ): Promise<{ loaded: WebRobotLoadedSource; browser: WebRobotBrowserSession }> => {
 	if (recipe.respectRobotsTxt) {
 		await robots.assertAllowed(url);
 	}
 	const browser = new WebRobotBrowserSession();
 	try {
-		return {
-			loaded: await browser.load(browserInspectionSource(url, true), { recipe, scope: {}, env }),
-			browser,
-		};
+		await policy.beforeRequest(url);
+		const loaded = await browser.load(browserInspectionSource(url, true), { recipe, scope: {}, env });
+		observeBrowserStatus(policy, loaded, url);
+		return { loaded, browser };
 	} catch (error) {
 		await browser.close().catch(() => undefined);
 		throw error;
@@ -238,6 +280,7 @@ const observeBrowserPagination = async (
 	recipe: WebRobotRecipe,
 	env: Record<string, string>,
 	discovery: WebRobotSourceDiscovery,
+	policy: AuthoringRequestPolicy,
 ): Promise<void> => {
 	const initialBrowserProducts = discovery.domCandidates.some((candidate) => candidate.loader === 'browser');
 	const hasNextLink = discovery.paginationCandidates.some((candidate) => candidate.type === 'nextLink');
@@ -259,18 +302,25 @@ const observeBrowserPagination = async (
 		];
 	};
 
+	await policy.beforeRequest(url);
 	const observed = await browser.probePagination(
 		browserInspectionSource(url, false),
 		{ recipe, scope: {}, env },
 		initialBrowserProducts ? clickSelectors() : [],
 		actionSelectors,
 	);
+	if (observed.loaded) {
+		observeBrowserStatus(policy, observed.loaded, url);
+	}
 	markObservedBrowserActions(discovery, observed.actions ?? []);
 	if (observed.loaded && observed.actions?.length) {
 		analyzeLoadedPage({ loaded: observed.loaded, loader: 'browser' }, discovery);
 	}
 	const hasBrowserProducts =
 		initialBrowserProducts || discovery.domCandidates.some((candidate) => candidate.loader === 'browser');
+	if (hasBrowserProducts && !initialBrowserProducts) {
+		await policy.beforeRequest(url);
+	}
 	const pagination =
 		hasBrowserProducts && !initialBrowserProducts
 			? await browser.probePagination(
@@ -280,7 +330,16 @@ const observeBrowserPagination = async (
 					[],
 				)
 			: observed;
+	if (pagination.loaded) {
+		observeBrowserStatus(policy, pagination.loaded, url);
+	}
 	applyObservedPagination(discovery, pagination, clickSelectors());
+};
+
+const observeBrowserStatus = (policy: AuthoringRequestPolicy, loaded: WebRobotLoadedSource, url: string): void => {
+	if (loaded.status === 429) {
+		policy.observeResponse(loaded.finalUrl || url, new Response(null, { status: 429 }));
+	}
 };
 
 const markObservedBrowserActions = (discovery: WebRobotSourceDiscovery, observedSelectors: string[]): void => {
@@ -389,6 +448,7 @@ const analyzeLoadedPage = (page: LoadedPage, discovery: WebRobotSourceDiscovery)
 	}
 	const $ = cheerio.load(loaded.bodyText);
 	discovery.title ??= $('title').first().text().trim() || undefined;
+	mergePageContext($, loaded.finalUrl, discovery.pageContext);
 	discovery.jsonLdCandidates.push(...jsonLdCandidates($, loaded.finalUrl, loader));
 	discovery.embeddedCandidates.push(...embeddedCandidates(loaded.bodyText, loaded.finalUrl, loader));
 	discovery.domCandidates.push(...domCandidates($, loaded.finalUrl, loader));
@@ -409,16 +469,21 @@ const discoverReferencedEndpoints = async (
 	recipe: WebRobotRecipe,
 	env: Record<string, string>,
 	robots: RobotsTxtPolicy,
+	policy: AuthoringRequestPolicy,
 	discovery: WebRobotSourceDiscovery,
 	warnings: string[],
 	probedResources: Set<string>,
 ): Promise<void> => {
-	if (!loaded.bodyText || !loaded.bodyText.includes('<')) {
+	if (policy.rateLimited || !loaded.bodyText || !loaded.bodyText.includes('<')) {
 		return;
 	}
 	const $ = cheerio.load(loaded.bodyText);
 	const endpoints = collectEndpointCandidates($, loaded.finalUrl, loaded.bodyText);
 	for (const scriptUrl of scriptSourceUrls($, loaded.finalUrl)) {
+		if (policy.rateLimited) {
+			addRateLimitBlocker(discovery);
+			return;
+		}
 		if (!probedResources.add(`script:${scriptUrl}`)) {
 			continue;
 		}
@@ -428,8 +493,9 @@ const discoverReferencedEndpoints = async (
 			}
 			const script = await loadHttpSource(
 				{ type: 'http', url: scriptUrl, method: 'GET', headers: {} },
-				{ recipe, scope: {}, env },
+				{ recipe, scope: {}, env, requestPolicy: policy },
 			);
+			policy.remember(scriptUrl, script);
 			for (const raw of endpointLiterals(script.bodyText ?? '')) {
 				addEndpointCandidate(endpoints, raw, loaded.finalUrl, 'GET', 'script');
 			}
@@ -439,6 +505,10 @@ const discoverReferencedEndpoints = async (
 	}
 
 	for (const endpoint of [...endpoints.values()].slice(0, MAX_ENDPOINT_PROBES)) {
+		if (policy.rateLimited) {
+			addRateLimitBlocker(discovery);
+			return;
+		}
 		if (discovery.apiCandidates.some((candidate) => candidate.url === endpoint.url && candidate.method === 'GET')) {
 			endpoint.probed = true;
 			endpoint.productCandidate = true;
@@ -453,8 +523,9 @@ const discoverReferencedEndpoints = async (
 			}
 			const result = await loadHttpSource(
 				{ type: 'api', url: endpoint.url, method: 'GET', query: {}, headers: {} },
-				{ recipe, scope: {}, env },
+				{ recipe, scope: {}, env, requestPolicy: policy },
 			);
+			policy.remember(endpoint.url, result);
 			endpoint.probed = true;
 			endpoint.status = result.status;
 			if (!result.bodyJson) {
@@ -481,6 +552,9 @@ const discoverReferencedEndpoints = async (
 		) {
 			discovery.endpointCandidates.push(endpoint);
 		}
+	}
+	if (policy.rateLimited) {
+		addRateLimitBlocker(discovery);
 	}
 };
 
@@ -561,7 +635,7 @@ const endpointUrl = (raw: string | undefined, baseUrl: string): string | null =>
 	if (!raw || /^(?:data:|javascript:|mailto:|tel:)/i.test(raw)) {
 		return null;
 	}
-	const absolute = absoluteSameHostUrl(raw.replaceAll('\\/', '/'), baseUrl);
+	const absolute = absoluteSameHostUrl(decodeHtmlEntities(raw).replaceAll('\\/', '/'), baseUrl);
 	if (!absolute || absolute.includes('${') || absolute.includes('{{')) {
 		return null;
 	}
@@ -581,17 +655,41 @@ const endpointLiterals = (text: string): string[] => {
 };
 
 const looksLikeEndpoint = (url: string, source: WebRobotEndpointCandidate['source']): boolean => {
-	if (source === 'form') {
-		return true;
-	}
 	const parsed = new URL(url);
 	if (STATIC_ENDPOINT_PATH.test(parsed.pathname)) {
 		return false;
 	}
-	return parsed.pathname.endsWith('.json') || ENDPOINT_PATH_PATTERN.test(`${parsed.pathname}${parsed.search}`);
+	if (/\.json$/i.test(parsed.pathname) || API_ENDPOINT_PATH.test(parsed.pathname)) {
+		return true;
+	}
+	return source === 'script' && SCRIPT_ENDPOINT_PATTERN.test(`${parsed.pathname}${parsed.search}`);
 };
 
-const ENDPOINT_PATH_PATTERN = /(api|graphql|search|catalog|catalogue|items|results|query|filter|listing)/i;
+const decodeHtmlEntities = (value: string): string => {
+	return value.replace(/&(amp|lt|gt|quot|apos|nbsp|#x[0-9a-fA-F]+|#\d+);/g, (entity, code: string) => {
+		switch (code) {
+			case 'amp':
+				return '&';
+			case 'lt':
+				return '<';
+			case 'gt':
+				return '>';
+			case 'quot':
+				return '"';
+			case 'apos':
+				return "'";
+			case 'nbsp':
+				return ' ';
+		}
+		const codePoint = code.startsWith('#x')
+			? Number.parseInt(code.slice(2), 16)
+			: Number.parseInt(code.slice(1), 10);
+		return Number.isFinite(codePoint) ? String.fromCodePoint(codePoint) : entity;
+	});
+};
+
+const API_ENDPOINT_PATH = /(?:^|[/_.-])(?:api|graphql|ajax)(?=[/_.-]|$)/i;
+const SCRIPT_ENDPOINT_PATTERN = /(search|items|results|query|catalog|catalogue|listing)/i;
 const STATIC_ENDPOINT_PATH = /\.(?:css|js|map|png|jpe?g|gif|webp|avif|svg|ico|woff2?|ttf|eot|mp4|webm|pdf|zip)$/i;
 const SENSITIVE_ENDPOINT_KEY = /(authorization|cookie|csrf|token|secret|password|api[_-]?key|session|auth)/i;
 
@@ -609,6 +707,17 @@ export const detectWebRobotSourceBlockers = (
 	return detectLoadedSourceBlockers(page.loaded, page.loader, hasCandidates, $);
 };
 
+const addRateLimitBlocker = (discovery: WebRobotSourceDiscovery): void => {
+	addBlockers(discovery, [
+		{
+			kind: 'rate_limited',
+			loader: 'http',
+			status: 429,
+			message: 'The source is rate limiting requests.',
+		},
+	]);
+};
+
 const addBlockers = (discovery: WebRobotSourceDiscovery, blockers: WebRobotSourceBlocker[]): void => {
 	for (const blocker of blockers) {
 		if (
@@ -624,8 +733,187 @@ const addBlockers = (discovery: WebRobotSourceDiscovery, blockers: WebRobotSourc
 	}
 };
 
+const SEARCH_PARAM_PATTERN = /^(q|query|search|search_?term|text|keyword|term)$/i;
+const PAGINATION_PARAM_PATTERN =
+	/^(page|p|page_?number|current_?page|search_?page|cursor|after|next_?cursor|next_?token|offset|start|from|limit|per_?page|page_?size|size)$/i;
+
+const filtersFromUrl = (rawUrl: string): Record<string, string | string[]> => {
+	const grouped = new Map<string, string[]>();
+	try {
+		for (const [key, value] of new URL(rawUrl).searchParams) {
+			if (
+				SENSITIVE_ENDPOINT_KEY.test(key) ||
+				PAGINATION_PARAM_PATTERN.test(key) ||
+				SEARCH_PARAM_PATTERN.test(key)
+			) {
+				continue;
+			}
+			if (grouped.size >= 32 && !grouped.has(key)) {
+				continue;
+			}
+			const values = grouped.get(key) ?? [];
+			if (values.length < 32) {
+				values.push(value);
+			}
+			grouped.set(key, values);
+		}
+	} catch {
+		return {};
+	}
+	return Object.fromEntries([...grouped].map(([key, values]) => [key, values.length === 1 ? values[0]! : values]));
+};
+
+const searchTermFromUrl = (rawUrl: string): string | undefined => {
+	try {
+		for (const [key, value] of new URL(rawUrl).searchParams) {
+			if (SEARCH_PARAM_PATTERN.test(key) && value.trim()) {
+				return value.trim().slice(0, 512);
+			}
+		}
+	} catch {
+		return undefined;
+	}
+	return undefined;
+};
+
 const shouldInspectWithBrowser = (discovery: WebRobotSourceDiscovery): boolean => {
-	return discovery.apiCandidates.length === 0;
+	const eligiblePagination = discovery.paginationCandidates.some((candidate) =>
+		['page', 'offset', 'cursor', 'nextPath', 'nextLink'].includes(candidate.type),
+	);
+	for (const candidate of discovery.apiCandidates) {
+		if (!hasProductDiscriminator(candidate, discovery)) {
+			continue;
+		}
+		const matchingCount = discovery.pageContext.displayedCounts.some(
+			(count) => count.value === candidate.itemCount,
+		);
+		if (matchingCount || eligiblePagination) {
+			return false;
+		}
+	}
+	return true;
+};
+
+const mergePageContext = ($: CheerioAPI, finalUrl: string, context: WebRobotPageContext): void => {
+	const lang = $('html').attr('lang')?.trim();
+	if (lang && !context.locale) {
+		context.locale = lang.slice(0, 64);
+	}
+	for (const element of $('main h1, main h2, h1, h2').toArray()) {
+		const text = $(element).text().replace(/\s+/g, ' ').trim();
+		if (text && !context.headings.includes(text) && context.headings.length < 8) {
+			context.headings.push(text);
+		}
+	}
+	for (const element of $('nav[aria-label*=breadcrumb i] a, .breadcrumb a, [class*=breadcrumb i] a').toArray()) {
+		const text = $(element).text().replace(/\s+/g, ' ').trim();
+		if (text && !context.breadcrumbs.includes(text) && context.breadcrumbs.length < 16) {
+			context.breadcrumbs.push(text);
+		}
+	}
+	const activeFilters = { ...context.activeFilters };
+	$('select option[selected], select option:checked')
+		.toArray()
+		.slice(0, 64)
+		.forEach((element) => {
+			const option = $(element);
+			const select = option.closest('select');
+			const name = select.attr('name') ?? select.attr('id');
+			const value = option.attr('value') ?? option.text().replace(/\s+/g, ' ').trim();
+			if (name && value && !SENSITIVE_ENDPOINT_KEY.test(name) && !PAGINATION_PARAM_PATTERN.test(name)) {
+				activeFilters[name] = value.slice(0, 512);
+			}
+		});
+	$('input[checked]')
+		.toArray()
+		.slice(0, 64)
+		.forEach((element) => {
+			const input = $(element);
+			const name = input.attr('name');
+			const value = input.attr('value') ?? input.attr('id') ?? 'on';
+			if (name && !SENSITIVE_ENDPOINT_KEY.test(name) && !PAGINATION_PARAM_PATTERN.test(name)) {
+				const existing = activeFilters[name];
+				const normalized = value.slice(0, 512);
+				activeFilters[name] = existing
+					? [...new Set([...(Array.isArray(existing) ? existing : [existing]), normalized])].slice(0, 32)
+					: normalized;
+			}
+		});
+	for (const key of Object.keys(activeFilters).slice(32)) {
+		delete activeFilters[key];
+	}
+	context.activeFilters = activeFilters;
+	const seenCounts = new Set(
+		context.displayedCounts.map((count) => `${count.value}|${count.unitLabel}|${count.text}`),
+	);
+	for (const count of displayedCounts($, finalUrl)) {
+		const key = `${count.value}|${count.unitLabel}|${count.text}`;
+		if (!seenCounts.has(key) && context.displayedCounts.length < 8) {
+			seenCounts.add(key);
+			context.displayedCounts.push({ ...count, id: `displayed-count-${context.displayedCounts.length}` });
+		}
+	}
+};
+
+const DISPLAY_COUNT_SELECTORS =
+	'.woocommerce-result-count, [class*="result-count" i], [class*="results-count" i], [class*="product-count" i], [data-total-results], [data-total-products], [aria-live]';
+
+const displayedCounts = ($: CheerioAPI, sourceUrl: string): Omit<WebRobotDisplayedCount, 'id'>[] => {
+	const counts: Omit<WebRobotDisplayedCount, 'id'>[] = [];
+	const seen = new Set<string>();
+	for (const element of $(DISPLAY_COUNT_SELECTORS).toArray().slice(0, 16)) {
+		const node = $(element);
+		const text = node.text().replace(/\s+/g, ' ').trim().slice(0, 300);
+		const attrTotal = node.attr('data-total-results') ?? node.attr('data-total-products');
+		const parsed = parseDisplayedCount(text, attrTotal);
+		if (!parsed) {
+			continue;
+		}
+		const key = `${parsed.value}|${parsed.unitLabel}|${parsed.text}`;
+		if (seen.has(key)) {
+			continue;
+		}
+		seen.add(key);
+		counts.push({ ...parsed, sourceUrl });
+	}
+	return counts;
+};
+
+const countNumber = (raw: string): number | null => {
+	const value = Number(raw.replace(/[^\d]/g, ''));
+	return Number.isFinite(value) && value > 0 ? value : null;
+};
+
+const parseDisplayedCount = (
+	text: string,
+	attrTotal: string | undefined,
+): { value: number; unitLabel: string; text: string; kind: 'total' | 'all_results' } | null => {
+	const attrValue = attrTotal ? countNumber(attrTotal) : null;
+	if (attrValue) {
+		return { value: attrValue, unitLabel: 'results', text: text || String(attrValue), kind: 'total' };
+	}
+	const allResults = /showing\s+all\s+([\d][\d.,\s]*)\s*(results?|products?|items?)/i.exec(text);
+	if (allResults) {
+		const value = countNumber(allResults[1]!);
+		if (value) {
+			return { value, unitLabel: allResults[2]!.toLowerCase(), text, kind: 'all_results' };
+		}
+	}
+	const range = /[\d][\d.,]*\s*[-–—]\s*[\d][\d.,]*\s+of\s+([\d][\d.,\s]*)\s*(results?|products?|items?)/i.exec(text);
+	if (range) {
+		const value = countNumber(range[1]!);
+		if (value) {
+			return { value, unitLabel: range[2]!.toLowerCase(), text, kind: 'total' };
+		}
+	}
+	const plain = /([\d][\d.,\s]*)\s*(results?|products?|items?)\b/i.exec(text);
+	if (plain) {
+		const value = countNumber(plain[1]!);
+		if (value) {
+			return { value, unitLabel: plain[2]!.toLowerCase(), text, kind: 'total' };
+		}
+	}
+	return null;
 };
 
 const looksLikeHtml = (loaded: WebRobotLoadedSource): boolean => {
@@ -645,8 +933,13 @@ const jsonArrayCandidates = (
 ): WebRobotApiCandidate[] => {
 	const candidates: WebRobotApiCandidate[] = [];
 	for (const entry of jsonArrayEntries(body)) {
-		const fields = inferJsonFields(entry.items.slice(0, 10));
-		const score = scoreJsonFields(fields, entry.items.length, method, kind);
+		const filtered = productItems(entry.items);
+		const items = filtered.items;
+		if (items.length < 2) {
+			continue;
+		}
+		const fields = inferJsonFields(items.slice(0, 10));
+		const score = scoreJsonFields(fields, items.length, method, kind);
 		if (score <= 0) {
 			continue;
 		}
@@ -660,18 +953,74 @@ const jsonArrayCandidates = (
 			captureName,
 			capturePattern,
 			itemsPath: entry.path,
-			itemCount: entry.items.length,
+			itemCount: items.length,
+			...(filtered.where ? { where: filtered.where } : {}),
 			fields,
 			fieldNames: Object.keys(fields),
 			identityField: fields.sku?.path ?? fields.external_id?.path,
 			urlField: fields.url?.path,
 			nameField: fields.name?.path,
-			productUrls: entry.items.flatMap((item) => jsonItemUrl(item, fields.url?.path, url)).slice(0, 25),
-			sample: sampleJson(entry.items[0]!),
+			productUrls: items.flatMap((item) => jsonItemUrl(item, fields.url?.path, url)).slice(0, 25),
+			sample: sampleJson(items[0]!),
+			samples: diverseJsonSamples(items),
+			recordTypes: jsonRecordTypes(items),
+			technicalFieldPaths: jsonTechnicalFieldPaths(items),
 			score,
 		});
 	}
 	return candidates.sort((left, right) => right.score - left.score).slice(0, 6);
+};
+
+const diverseJsonSamples = (items: Record<string, unknown>[]): Record<string, unknown>[] => {
+	const seen = new Set<string>();
+	const unique = items.filter((item) => {
+		const key = JSON.stringify(item);
+		if (seen.has(key)) {
+			return false;
+		}
+		seen.add(key);
+		return true;
+	});
+	const picks = [unique[0], unique[Math.floor(unique.length / 2)], unique[unique.length - 1]];
+	return [...new Set(picks.filter((item): item is Record<string, unknown> => Boolean(item)))]
+		.slice(0, 3)
+		.map(sampleJson);
+};
+
+const RECORD_TYPE_FIELD_PATTERN = /^(type|kind|result_?type|record_?type|content_?type|entry_?type|item_?type)$/i;
+
+const jsonRecordTypes = (items: Record<string, unknown>[]): string[] => {
+	const types = new Set<string>();
+	for (const item of items.slice(0, 20)) {
+		for (const entry of flattenJson(item)) {
+			const key = entry.path[entry.path.length - 1];
+			if (key && RECORD_TYPE_FIELD_PATTERN.test(key) && typeof entry.value === 'string' && entry.value.trim()) {
+				types.add(entry.value.slice(0, 64));
+			}
+		}
+		if (types.size >= 16) {
+			break;
+		}
+	}
+	return [...types].slice(0, 16);
+};
+
+const TECHNICAL_FIELD_PATTERN =
+	/spec|technical|attribute|property|dimension|pressure|voltage|material|weight|size|capacity|flow|temperature|diameter/i;
+
+const jsonTechnicalFieldPaths = (items: Record<string, unknown>[]): string[] => {
+	const paths = new Set<string>();
+	for (const item of items.slice(0, 20)) {
+		for (const entry of flattenJson(item)) {
+			if (entry.path.some((segment) => TECHNICAL_FIELD_PATTERN.test(segment))) {
+				paths.add(entry.path.join('.'));
+			}
+			if (paths.size >= 32) {
+				break;
+			}
+		}
+	}
+	return [...paths].slice(0, 32);
 };
 
 const jsonArrayEntries = (body: unknown): { path?: string; items: Record<string, unknown>[] }[] => {
@@ -806,13 +1155,18 @@ const scoreJsonFields = (
 	return score;
 };
 
+const PAGE_TOTAL_KEY = /^(totalPages|pageCount|total_?pages|numberOfPages|totalNumberOfPages)$/i;
+const ITEM_TOTAL_KEY =
+	/^(total|total_?count|total_?items|result_?count|results_?count|hit_?count|total_?hits|total_?results|number_?of_?results|total_?number_?of_?results|number_?of_?items|total_?number_?of_?items|total_?records|records_?count)$/i;
+
 const jsonPaginationCandidates = (
 	body: unknown,
 	request: { url?: string; requestBody?: unknown; itemCount?: number } = {},
 ): WebRobotPaginationCandidate[] => {
 	const candidates: WebRobotPaginationCandidate[] = [];
 	let cursorPath: string | undefined;
-	let totalPath: string | undefined;
+	let pageTotal: { path: string; value: number } | undefined;
+	let itemTotal: { path: string; value: number } | undefined;
 	const visit = (value: unknown, path: string[] = []): void => {
 		if (!value || typeof value !== 'object') {
 			return;
@@ -829,17 +1183,13 @@ const jsonPaginationCandidates = (
 			) {
 				cursorPath ??= nextPath.join('.');
 			}
-			if (
-				typeof entry === 'number' &&
-				/^(totalPages|pageCount|total_pages|numberOfPages|totalNumberOfPages)$/i.test(key)
-			) {
-				candidates.push({ type: 'page', pageVariable: 'page', totalPagesPath: nextPath.join('.') });
-			}
-			if (
-				typeof entry === 'number' &&
-				/^(total|total_?count|total_?items|result_?count|hit_?count)$/i.test(key)
-			) {
-				totalPath ??= nextPath.join('.');
+			if (typeof entry === 'number') {
+				if (!pageTotal && PAGE_TOTAL_KEY.test(key)) {
+					pageTotal = { path: nextPath.join('.'), value: entry };
+				}
+				if (!itemTotal && ITEM_TOTAL_KEY.test(key)) {
+					itemTotal = { path: nextPath.join('.'), value: entry };
+				}
 			}
 			if (entry && typeof entry === 'object') {
 				visit(entry, nextPath);
@@ -856,30 +1206,40 @@ const jsonPaginationCandidates = (
 			nextCursorPath: cursorPath,
 		});
 	}
-	const offset = requestValue(request, /^(offset|start|from)$/i);
+	const pageParam = requestParam(request, /^(page|p|page_?number|page_?index|page_?no)$/i);
+	if (pageTotal || pageParam) {
+		candidates.push({
+			type: 'page',
+			pageVariable: pageParam?.key ?? 'page',
+			...(pageTotal ? { totalPagesPath: pageTotal.path, declaredPages: pageTotal.value } : {}),
+			...(itemTotal ? { totalItemsPath: itemTotal.path, declaredItems: itemTotal.value } : {}),
+		});
+	}
+	const offset = requestParam(request, /^(offset|start|from)$/i);
 	const pageSize = requestValue(request, /^(limit|page_?size|per_?page|size)$/i) ?? request.itemCount;
-	if (totalPath && (offset !== undefined || pageSize !== undefined)) {
+	if (itemTotal && (offset !== undefined || (pageSize !== undefined && !pageParam))) {
 		candidates.push({
 			type: 'offset',
-			offsetVariable: 'offset',
-			firstOffset: Number(offset ?? 0),
+			offsetVariable: offset?.key ?? 'offset',
+			firstOffset: Number(offset?.value ?? 0),
 			pageSize: Math.max(1, Math.min(Number(pageSize ?? 50), 1_000)),
-			totalPath,
+			totalPath: itemTotal.path,
+			declaredItems: itemTotal.value,
 		});
 	}
 	return dedupePaginationCandidates(candidates).slice(0, 4);
 };
 
-const requestValue = (
+const requestParam = (
 	request: { url?: string; requestBody?: unknown },
 	pattern: RegExp,
-): string | number | undefined => {
+): { key: string; value: string | number } | undefined => {
 	if (request.url) {
 		try {
 			for (const [key, value] of new URL(request.url).searchParams.entries()) {
 				if (pattern.test(key)) {
 					const numeric = Number(value);
-					return Number.isFinite(numeric) && value !== '' ? numeric : value;
+					return { key, value: Number.isFinite(numeric) && value !== '' ? numeric : value };
 				}
 			}
 		} catch {
@@ -889,11 +1249,14 @@ const requestValue = (
 	for (const entry of flattenJson(request.requestBody)) {
 		const key = entry.path[entry.path.length - 1];
 		if (key && pattern.test(key) && (typeof entry.value === 'string' || typeof entry.value === 'number')) {
-			return entry.value;
+			return { key, value: entry.value };
 		}
 	}
 	return undefined;
 };
+
+const requestValue = (request: { url?: string; requestBody?: unknown }, pattern: RegExp): string | number | undefined =>
+	requestParam(request, pattern)?.value;
 
 const dedupePaginationCandidates = (candidates: WebRobotPaginationCandidate[]): WebRobotPaginationCandidate[] => {
 	const seen = new Set<string>();
@@ -935,6 +1298,7 @@ const jsonLdCandidates = ($: CheerioAPI, pageUrl: string, loader: 'http' | 'brow
 			fields: inferJsonFields(products.slice(0, 10)),
 			productUrls: products.flatMap((item) => jsonLdProductUrl(item)).slice(0, 20),
 			sample: sampleJson(products[0]!),
+			samples: diverseJsonSamples(products),
 			score: 45 + Math.min(products.length, 10) * 4,
 		});
 	}
@@ -952,6 +1316,7 @@ const jsonLdCandidates = ($: CheerioAPI, pageUrl: string, loader: 'http' | 'brow
 			},
 			productUrls: urls,
 			sample: sampleJson(listItems[0]!),
+			samples: diverseJsonSamples(listItems),
 			score: 35 + Math.min(listItems.length, 10) * 4 + (urls.length ? 15 : 0),
 		});
 	}
@@ -965,6 +1330,7 @@ const jsonLdCandidates = ($: CheerioAPI, pageUrl: string, loader: 'http' | 'brow
 			fields: {},
 			productUrls: urls,
 			sample: sampleJson(itemLists[0]!),
+			samples: diverseJsonSamples(itemLists),
 			score: urls.length ? 40 + Math.min(urls.length, 10) * 3 : 15,
 		});
 	}
@@ -1005,6 +1371,7 @@ const embeddedCandidates = (html: string, pageUrl: string, loader: 'http' | 'bro
 				fields,
 				productUrls: items.flatMap((item) => jsonItemUrl(item, fields.url?.path, pageUrl)).slice(0, 20),
 				sample: sampleJson(items[0]!),
+				samples: diverseJsonSamples(items),
 				score: scoreJsonFields(fields, items.length, 'GET', 'network') + (source === 'scriptJson' ? 8 : 12),
 			});
 		}
@@ -1139,6 +1506,9 @@ const domCandidates = ($: CheerioAPI, pageUrl: string, loader: 'http' | 'browser
 					if (!existing.productUrls.includes(absolute)) {
 						existing.productUrls.push(absolute);
 					}
+					if (existing.samples.length < 3 && !existing.samples.some((sample) => sample.href === absolute)) {
+						existing.samples.push({ text, href: absolute });
+					}
 					continue;
 				}
 				grouped.set(key, {
@@ -1146,6 +1516,7 @@ const domCandidates = ($: CheerioAPI, pageUrl: string, loader: 'http' | 'browser
 					itemCount: 0,
 					productUrls: [absolute],
 					sample: { text, href: absolute },
+					samples: [{ text, href: absolute }],
 				});
 			}
 		});
@@ -1185,8 +1556,8 @@ const anchorItemCandidates = (
 	anchor: Cheerio<AnyNode>,
 	productSignal: boolean,
 	loader: 'http' | 'browser',
-): Omit<WebRobotDomCandidate, 'itemCount' | 'productUrls' | 'sample'>[] => {
-	const candidates: Omit<WebRobotDomCandidate, 'itemCount' | 'productUrls' | 'sample'>[] = [];
+): Omit<WebRobotDomCandidate, 'itemCount' | 'productUrls' | 'sample' | 'samples'>[] => {
+	const candidates: Omit<WebRobotDomCandidate, 'itemCount' | 'productUrls' | 'sample' | 'samples'>[] = [];
 	const anchorSelector = selectorFor(anchor);
 	if (anchorSelector && countSelector($, anchorSelector) >= 2) {
 		candidates.push({
@@ -1227,11 +1598,26 @@ const anchorItemCandidates = (
 			? relativeAnchorSelector(anchorSelector)
 			: contextualAnchorSelector($, anchor);
 		const linkSelectors = linkSelectorCandidates($, anchor, linkSelector);
-		const descriptionSelectors = descendantSelectors(current, [
+		const membershipSelectors = descendantSelectors(current, [
+			'[itemprop="category"]',
+			'[data-category]',
+			'[data-family]',
+			'[class*="category" i]',
+			'[class*="family" i]',
+			'[class*="collection" i]',
+			'[class*="taxonomy" i]',
+			'[class*="-cat " i]',
+			'[class$="-cat" i]',
+		]);
+		const explicitDescriptionSelectors = descendantSelectors(current, [
 			'[itemprop="description"]',
 			'[class*="description" i]',
-			'p',
 		]);
+		const descriptionSelectors = explicitDescriptionSelectors.length
+			? explicitDescriptionSelectors
+			: membershipSelectors.length === 0
+				? descendantSelectors(current, ['p'])
+				: [];
 		const priceSelectors = descendantSelectors(current, ['[itemprop="price"]', '[class*="price" i]', '.price']);
 		candidates.push({
 			loader,
@@ -1256,6 +1642,17 @@ const anchorItemCandidates = (
 					required: true,
 					transforms: ['normalizeWhitespace'],
 				},
+				...(membershipSelectors.length
+					? {
+							categories: {
+								selector: membershipSelectors[0],
+								selectors: membershipSelectors,
+								fingerprint: fingerprintForSelector(current, membershipSelectors[0]),
+								multiple: true,
+								transforms: ['normalizeWhitespace'],
+							},
+						}
+					: {}),
 				...(descriptionSelectors.length
 					? {
 							description: {
@@ -1289,6 +1686,7 @@ const anchorItemCandidates = (
 				30 +
 				Math.min(count, 20) +
 				(productSignal ? 20 : 0) +
+				(membershipSelectors.length ? 4 : 0) +
 				(descriptionSelectors.length ? 4 : 0) +
 				(priceSelectors.length ? 6 : 0),
 		});
@@ -1610,15 +2008,19 @@ const inspectDetailCandidates = async (
 	recipe: WebRobotRecipe,
 	env: Record<string, string>,
 	robots: RobotsTxtPolicy,
+	policy: AuthoringRequestPolicy,
 	allowedHosts: string[],
 	productUrls: string[],
 	warnings: string[],
 ): Promise<WebRobotDetailCandidate[]> => {
 	const details: WebRobotDetailCandidate[] = [];
 	for (const url of productUrls.slice(0, MAX_DETAIL_PAGES)) {
+		if (policy.rateLimited) {
+			break;
+		}
 		try {
 			await assertPublicHttpUrl(url, allowedHosts);
-			const loaded = await loadHttp(url, recipe, env, robots);
+			const loaded = await loadHttp(url, recipe, env, robots, policy);
 			if (!loaded.bodyText) {
 				continue;
 			}

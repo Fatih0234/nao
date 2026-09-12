@@ -23,6 +23,7 @@ import type {
 	WebRobotExecutionOptions,
 	WebRobotExecutionResult,
 	WebRobotLoadedSource,
+	WebRobotRequestPolicy,
 	WebRobotRunEvent,
 	WebRobotRunWarning,
 	WebRobotStageRecord,
@@ -44,6 +45,8 @@ type RunnerContext = {
 	startedAt: number;
 	robots: RobotsTxtPolicy;
 	browser: WebRobotBrowserSession;
+	requestPolicy?: WebRobotRequestPolicy;
+	responseCache?: ReadonlyMap<string, WebRobotLoadedSource>;
 };
 
 export const runWebRobotRecipe = async (
@@ -222,22 +225,43 @@ const loadSource = async (
 		await context.robots.assertAllowed(renderedUrl, context.recipe.request.userAgent);
 	}
 
-	const loaded =
-		source.type === 'browser'
-			? await context.browser.load(source, {
-					recipe: context.recipe,
-					scope,
-					env: context.env,
-					signal: context.signal,
-				})
-			: await loadHttpSource(source, {
-					recipe: context.recipe,
-					scope,
-					env: context.env,
-					signal: context.signal,
-				});
+	let loaded: WebRobotLoadedSource;
+	if (source.type === 'browser') {
+		await context.requestPolicy?.beforeRequest(renderedUrl);
+		loaded = await context.browser.load(source, {
+			recipe: context.recipe,
+			scope,
+			env: context.env,
+			signal: context.signal,
+		});
+		if (loaded.status === 429) {
+			context.requestPolicy?.observeResponse(loaded.finalUrl || renderedUrl, new Response(null, { status: 429 }));
+		}
+	} else {
+		loaded =
+			cachedLoadedSource(source, renderedUrl, context) ??
+			(await loadHttpSource(source, {
+				recipe: context.recipe,
+				scope,
+				env: context.env,
+				signal: context.signal,
+				requestPolicy: context.requestPolicy,
+			}));
+	}
 	await trackLoaded(context, loaded);
 	return loaded;
+};
+
+const cachedLoadedSource = (
+	source: WebRobotSource,
+	renderedUrl: string,
+	context: RunnerContext,
+): WebRobotLoadedSource | undefined => {
+	if (source.type !== 'http' || (source.method ?? 'GET') !== 'GET' || source.body !== undefined) {
+		return undefined;
+	}
+	const cached = context.responseCache?.get(renderedUrl);
+	return cached ? { ...cached, requests: 0, requestAttempts: [] } : undefined;
 };
 
 const loadInteractivePaginatedSource = async (
@@ -252,6 +276,7 @@ const loadInteractivePaginatedSource = async (
 	if (context.recipe.respectRobotsTxt) {
 		await context.robots.assertAllowed(renderedUrl, context.recipe.request.userAgent);
 	}
+	await context.requestPolicy?.beforeRequest(renderedUrl);
 	const pages = await context.browser.loadPaginated(
 		source,
 		{
@@ -264,6 +289,9 @@ const loadInteractivePaginatedSource = async (
 		pagination,
 	);
 	for (const loaded of pages) {
+		if (loaded.status === 429) {
+			context.requestPolicy?.observeResponse(loaded.finalUrl || renderedUrl, new Response(null, { status: 429 }));
+		}
 		await trackLoaded(context, loaded);
 	}
 	return pages;
@@ -554,6 +582,8 @@ const createContext = (recipe: WebRobotRecipe, options: WebRobotExecutionOptions
 	startedAt: Date.now(),
 	robots: new RobotsTxtPolicy(fetchRobotsTxt),
 	browser: new WebRobotBrowserSession(),
+	requestPolicy: options.requestPolicy,
+	responseCache: options.responseCache,
 });
 
 const fetchRobotsTxt = async (robotsUrl: string): Promise<string | null> => {

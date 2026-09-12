@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 
 import type { WebRobotRecipe } from '@nao/shared/web-robot';
+import type { IdentityMetrics } from '@nao/shared/web-robot-trust';
 
 import type { WebRobotStageRecord } from './types';
 import { canonicalHttpUrl } from './url-policy';
@@ -45,6 +46,7 @@ export type NormalizedProducts = {
 	products: Record<string, unknown>[];
 	attributes: ProductAttributeRow[];
 	documents: ProductDocumentRow[];
+	identityMetrics: IdentityMetrics;
 };
 
 export const normalizeProducts = (
@@ -54,11 +56,28 @@ export const normalizeProducts = (
 	scrapedAt = new Date().toISOString(),
 ): NormalizedProducts => {
 	const recordsByKey = new Map<string, { data: Record<string, unknown>; sourceUrl?: string }>();
+	const configuredFieldUsage: Record<string, number> = {};
+	const descriptorsByKey = new Map<string, Set<string>>();
+	let fallbackUrlCount = 0;
+	let recordHashFallbackCount = 0;
 	for (const record of records) {
 		const data = { ...record.data };
 		const sourceUrl = stringValue(data.source_url ?? data.url ?? record.url);
 		const canonicalUrl = sourceUrl ? safeCanonicalUrl(sourceUrl) : null;
-		const productKey = productKeyFor(data, recipe, canonicalUrl ?? sourceUrl);
+		const identity = productIdentityFor(data, recipe, canonicalUrl ?? sourceUrl);
+		for (const field of identity.usedFields) {
+			configuredFieldUsage[field] = (configuredFieldUsage[field] ?? 0) + 1;
+		}
+		if (identity.fallback === 'url') {
+			fallbackUrlCount += 1;
+		}
+		if (identity.fallback === 'record') {
+			recordHashFallbackCount += 1;
+		}
+		const descriptors = descriptorsByKey.get(identity.productKey) ?? new Set<string>();
+		descriptors.add(identity.descriptor);
+		descriptorsByKey.set(identity.productKey, descriptors);
+		const productKey = identity.productKey;
 		const existing = recordsByKey.get(productKey);
 		recordsByKey.set(productKey, {
 			data: existing ? { ...existing.data, ...data } : data,
@@ -96,23 +115,62 @@ export const normalizeProducts = (
 		documents.push(...documentRows(productKey, data.documents ?? data.document_urls, canonicalUrl, runId));
 	}
 
-	return { products, attributes, documents };
+	const collisions = [...descriptorsByKey.entries()]
+		.filter(([, descriptors]) => descriptors.size > 1)
+		.map(([productKey, descriptors]) => ({
+			productKey,
+			identityDescriptors: [...descriptors].sort(),
+		}))
+		.sort((left, right) => left.productKey.localeCompare(right.productKey));
+
+	return {
+		products,
+		attributes,
+		documents,
+		identityMetrics: {
+			totalEntities: products.length,
+			configuredFieldUsage,
+			fallbackUrlCount,
+			recordHashFallbackCount,
+			collisionCount: collisions.length,
+			collisions,
+		},
+	};
 };
 
 export const productColumns = (): string[] => PRODUCT_COLUMNS;
 
-const productKeyFor = (data: Record<string, unknown>, recipe: WebRobotRecipe, fallbackUrl?: string): string => {
+export type ProductIdentity = {
+	productKey: string;
+	descriptor: string;
+	usedFields: string[];
+	fallback?: 'url' | 'record';
+};
+
+export const productIdentityFor = (
+	data: Record<string, unknown>,
+	recipe: WebRobotRecipe,
+	fallbackUrl?: string,
+): ProductIdentity => {
 	const parts = recipe.identity.fields
 		.map((field) => ({ field, value: identityValue(data[field], field) }))
 		.filter((entry) => entry.value !== undefined && entry.value !== null && entry.value !== '');
+	const selected = recipe.version === 2 ? parts.slice(0, 1) : parts;
 
-	if (parts.length === 0 && fallbackUrl) {
-		return `url:${fallbackUrl}`;
+	if (selected.length === 0 && fallbackUrl) {
+		const descriptor = `url:${fallbackUrl}`;
+		return { productKey: descriptor, descriptor, usedFields: [], fallback: 'url' };
 	}
-	if (parts.length === 0) {
-		return `record:${sha256(stableStringify(data))}`;
+	if (selected.length === 0) {
+		const descriptor = `record:${sha256(stableStringify(data))}`;
+		return { productKey: descriptor, descriptor, usedFields: [], fallback: 'record' };
 	}
-	return `key:${sha256(parts.map((part) => `${part.field}=${String(part.value)}`).join('|'))}`;
+	const descriptor = selected.map((part) => `${part.field}=${String(part.value)}`).join('|');
+	return {
+		productKey: `key:${sha256(descriptor)}`,
+		descriptor,
+		usedFields: selected.map((part) => part.field),
+	};
 };
 
 const identityValue = (value: unknown, field: string): unknown => {

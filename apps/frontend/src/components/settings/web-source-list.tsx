@@ -3,7 +3,17 @@ import { Archive, Play, Plus } from 'lucide-react';
 import { useState } from 'react';
 
 import type { WebRobotListItem } from '@/components/settings/web-source-recipe';
-import { formatDateTime, isActiveWebRobotRun, webRobotRunBadgeVariant } from '@/components/settings/web-source-recipe';
+import {
+	catalogueExecutionLabel,
+	catalogueGranularityLabel,
+	cataloguePublicationStatusLabel,
+	catalogueTrustBasisLabel,
+	catalogueTrustPresentation,
+	catalogueTrustStatusLabel,
+	formatDateTime,
+	isActiveWebRobotRun,
+	webSourcePrimaryActionLabel,
+} from '@/components/settings/web-source-recipe';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { ConfirmationDialog } from '@/components/ui/confirmation-dialog';
@@ -54,11 +64,11 @@ export function WebSourceList({
 					<Table>
 						<TableHeader>
 							<TableRow>
-								<TableHead>Name</TableHead>
+								<TableHead>Source and scope</TableHead>
+								<TableHead>Data status</TableHead>
+								<TableHead>Active data</TableHead>
+								<TableHead>Latest refresh</TableHead>
 								<TableHead>Schedule</TableHead>
-								<TableHead>Status</TableHead>
-								<TableHead>Last run</TableHead>
-								<TableHead>Products</TableHead>
 								<TableHead className='w-0'>Actions</TableHead>
 							</TableRow>
 						</TableHeader>
@@ -116,7 +126,18 @@ function WebSourceRow({
 	isRunning: boolean;
 }) {
 	const active = isActiveWebRobotRun(robot.lastRunStatus);
-	const nextRun = robot.enabled && robot.scheduledJob?.runAt ? formatDateTime(robot.scheduledJob.runAt) : null;
+	const state = robot.currentState;
+	const hasPendingConfiguration = Boolean(robot.pendingConfigurationId);
+	const trust = catalogueTrustPresentation(state, { hasPendingConfiguration });
+	const primaryActionLabel = webSourcePrimaryActionLabel({
+		state,
+		hasPendingConfiguration,
+		isActionPending: active || isRunning,
+	});
+	const activeSummary = state.activeSummary;
+	const published = Boolean(robot.lastPublishedRunId);
+	const nextRun =
+		published && robot.enabled && robot.scheduledJob?.runAt ? formatDateTime(robot.scheduledJob.runAt) : null;
 
 	return (
 		<TableRow>
@@ -128,48 +149,76 @@ function WebSourceRow({
 				>
 					<div className='truncate font-medium'>{robot.name}</div>
 					<div className='truncate text-xs text-muted-foreground'>{robot.slug}</div>
+					<div className='truncate text-xs text-muted-foreground'>
+						{activeSummary?.scopeLabel ?? 'Awaiting successful first refresh'}
+					</div>
 				</Link>
 			</TableCell>
 			<TableCell>
-				<div className='grid gap-0.5'>
-					<span className='font-mono text-xs'>{robot.cron || 'Manual'}</span>
-					{nextRun && <span className='text-xs text-muted-foreground'>Next: {nextRun}</span>}
-				</div>
+				<Badge variant={trust.variant}>{trust.label}</Badge>
 			</TableCell>
 			<TableCell>
-				{robot.cron ? (
-					<div className='flex items-center gap-2'>
-						<Switch checked={robot.enabled} onCheckedChange={(enabled) => onSetEnabled(robot, enabled)} />
-						<Badge variant={robot.enabled ? 'success' : 'outline'}>
-							{robot.enabled ? 'enabled' : 'paused'}
-						</Badge>
+				{activeSummary ? (
+					<div className='grid gap-0.5'>
+						<span className='text-sm'>
+							{activeSummary.entityCount} {catalogueGranularityLabel(activeSummary.granularity)}
+						</span>
+						<span className='text-xs text-muted-foreground'>
+							{catalogueTrustBasisLabel(activeSummary.basis)} · {formatDateTime(activeSummary.verifiedAt)}
+						</span>
 					</div>
 				) : (
-					<Badge variant='outline'>manual</Badge>
+					<span className='text-xs text-muted-foreground'>Not available to agents</span>
 				)}
 			</TableCell>
 			<TableCell>
 				<div className='grid gap-1'>
-					<Badge variant={webRobotRunBadgeVariant(robot.lastRunStatus)}>
-						{robot.lastRunStatus ?? 'never'}
-					</Badge>
+					<div className='flex flex-wrap gap-1'>
+						{state.executionStatus && (
+							<Badge variant='outline'>{catalogueExecutionLabel(state.executionStatus)}</Badge>
+						)}
+						{state.trustStatus && (
+							<Badge variant='outline'>{catalogueTrustStatusLabel(state.trustStatus)}</Badge>
+						)}
+						{state.publicationStatus && (
+							<Badge variant='outline'>{cataloguePublicationStatusLabel(state.publicationStatus)}</Badge>
+						)}
+					</div>
 					<span className='text-xs text-muted-foreground'>{formatDateTime(robot.lastRunStartedAt)}</span>
 				</div>
 			</TableCell>
-			<TableCell>{robot.lastPublishedProductCount ?? '—'}</TableCell>
+			<TableCell>
+				{published ? (
+					<div className='grid gap-1'>
+						<div className='flex items-center gap-2'>
+							<Switch
+								checked={robot.enabled}
+								disabled={!robot.cron}
+								onCheckedChange={(enabled) => onSetEnabled(robot, enabled)}
+							/>
+							<span className='font-mono text-xs'>{robot.cron || 'Manual'}</span>
+						</div>
+						{nextRun && <span className='text-xs text-muted-foreground'>Next: {nextRun}</span>}
+					</div>
+				) : (
+					<span className='text-xs text-muted-foreground'>Available after the first successful refresh</span>
+				)}
+			</TableCell>
 			<TableCell>
 				<div className='flex justify-end gap-1'>
-					<Button
-						type='button'
-						variant='ghost'
-						size='sm'
-						disabled={active || isRunning}
-						isLoading={isRunning}
-						onClick={() => onRunNow(robot)}
-					>
-						<Play className='size-3.5' />
-						Run now
-					</Button>
+					{primaryActionLabel && (
+						<Button
+							type='button'
+							variant='ghost'
+							size='sm'
+							disabled={active || isRunning || state.setupStatus !== 'configured'}
+							isLoading={isRunning}
+							onClick={() => onRunNow(robot)}
+						>
+							<Play className='size-3.5' />
+							{primaryActionLabel}
+						</Button>
+					)}
 					<Button type='button' variant='ghost' size='sm' onClick={onArchive}>
 						<Archive className='size-3.5' />
 						Archive

@@ -23,6 +23,7 @@ import { authorWebRobotRecipeFromUrl } from '../src/services/web-robot-authoring
 import { sanitizeAuthoredRecipe } from '../src/services/web-robot-authoring/generate';
 import { recipeRepairChanges, repairSourceUrl } from '../src/services/web-robot-authoring/repair';
 import { scoreExecution } from '../src/services/web-robot-authoring/score';
+import { WebRobotLoadError } from '../src/services/web-scraper/http-loader';
 
 const discovery = {
 	url: 'https://example.com/products',
@@ -49,6 +50,9 @@ const discovery = {
 			urlField: 'url',
 			productUrls: ['https://example.com/products/one'],
 			sample: { url: '/products/one', sku: 'SKU-1' },
+			samples: [{ url: '/products/one', sku: 'SKU-1' }],
+			recordTypes: [],
+			technicalFieldPaths: [],
 			score: 90,
 		},
 	],
@@ -57,7 +61,17 @@ const discovery = {
 	embeddedCandidates: [],
 	domCandidates: [],
 	detailCandidates: [],
-	paginationCandidates: [{ type: 'page' as const, pageVariable: 'page', totalPagesPath: 'totalPages' }],
+	paginationCandidates: [
+		{
+			type: 'page' as const,
+			pageVariable: 'page',
+			totalPagesPath: 'totalPages',
+			totalItemsPath: 'totalNumberOfResults',
+			declaredPages: 7,
+			declaredItems: 34,
+		},
+	],
+	pageContext: { headings: [], breadcrumbs: [], activeFilters: {}, displayedCounts: [] },
 	browserActionCandidates: [],
 	blockers: [],
 	warnings: [],
@@ -110,6 +124,8 @@ describe('web robot URL authoring', () => {
 			return;
 		}
 		const parsed = webRobotRecipeSchema.parse(result.recipe);
+		expect(parsed.version).toBe(2);
+		expect(parsed.identity).toEqual({ strategy: 'first_present', fields: ['sku', 'url'] });
 		expect(parsed.stages[0]?.source).toMatchObject({
 			type: 'api',
 			url: 'https://example.com/api/products',
@@ -118,6 +134,17 @@ describe('web robot URL authoring', () => {
 		expect(parsed.stages[0]?.paginate).toMatchObject({
 			type: 'page',
 			totalPagesPath: 'totalPages',
+			totalItemsPath: 'totalNumberOfResults',
+		});
+		expect(result.capabilities).toHaveLength(9);
+		expect(result.capabilities.find((entry) => entry.concept === 'name')).toMatchObject({
+			status: 'detected',
+			covered: 2,
+			sampled: 2,
+		});
+		expect(result.capabilities.find((entry) => entry.concept === 'membership')).toMatchObject({
+			status: 'not_detected',
+			covered: 0,
 		});
 		expect(mocks.generateModelRecipeCandidates).not.toHaveBeenCalled();
 	});
@@ -190,9 +217,11 @@ describe('web robot URL authoring', () => {
 						url: { selector: 'h3 a[href]', attr: 'href', required: true, transforms: ['absoluteUrl'] },
 						name: { selector: 'h3 a[href]', required: true, transforms: ['normalizeWhitespace'] },
 						price: { selector: '.price', transforms: ['parsePrice'] },
+						sku: { selector: '.sku' },
 					},
 					productUrls: ['https://example.com/products/one', 'https://example.com/products/two'],
 					sample: { text: 'One', href: 'https://example.com/products/one' },
+					samples: [{ text: 'One', href: 'https://example.com/products/one' }],
 					score: 80,
 				},
 			],
@@ -244,6 +273,7 @@ describe('web robot URL authoring', () => {
 					},
 					productUrls: ['https://example.com/products/one'],
 					sample: { resultType: 'PRODUCT', sku: 'SKU-1' },
+					samples: [{ resultType: 'PRODUCT', sku: 'SKU-1' }],
 					score: 82,
 				},
 			],
@@ -291,6 +321,144 @@ describe('web robot URL authoring', () => {
 
 		expect(result.status).toBe('interactive_needed');
 		expect(result.diagnostics.discovery.blockers[0]?.kind).toBe('login');
+	});
+
+	it('never returns ready for a wrong-scope candidate that extracts data', async () => {
+		mocks.discoverWebRobotSource.mockResolvedValue({
+			...discovery,
+			apiCandidates: [
+				{
+					...discovery.apiCandidates[0]!,
+					kind: 'api' as const,
+					url: 'https://example.com/api/products',
+					itemCount: 12,
+					captureName: undefined,
+					capturePattern: undefined,
+				},
+			],
+			paginationCandidates: [],
+			pageContext: {
+				headings: ['Products'],
+				breadcrumbs: [],
+				activeFilters: {},
+				displayedCounts: [
+					{
+						id: 'displayed-count-0',
+						value: 605,
+						unitLabel: 'results',
+						text: '605 results',
+						kind: 'total' as const,
+						sourceUrl: 'https://example.com/products',
+					},
+				],
+			},
+		});
+
+		const result = await authorWebRobotRecipeFromUrl({
+			projectId: 'project-id',
+			url: discovery.url,
+			env: {},
+		});
+
+		expect(mocks.runWebRobotRecipe).toHaveBeenCalled();
+		expect(result.status).toBe('partial');
+		if (result.status === 'partial') {
+			expect(result.reason).toContain('subset');
+			expect(result.scope.id).toBe('scope-current');
+			expect(result.verificationPlan.traversals[0]?.mode).toBe('finite');
+			expect(result.countSignals.map((signal) => signal.id)).toContain('displayed-count-0');
+		}
+	});
+
+	it('accepts a structurally viable candidate below the old score threshold', async () => {
+		mocks.discoverWebRobotSource.mockResolvedValue({
+			...discovery,
+			apiCandidates: [],
+			domCandidates: [
+				{
+					loader: 'http' as const,
+					itemSelector: '.product-card',
+					linkSelector: 'a[href]',
+					itemCount: 1,
+					productUrlCount: 1,
+					fields: {
+						url: { selector: 'a[href]', attr: 'href', required: true, transforms: ['absoluteUrl'] },
+						name: { selector: 'a[href]', required: true, transforms: ['normalizeWhitespace'] },
+					},
+					productUrls: ['https://example.com/products/one'],
+					sample: { text: 'One', href: 'https://example.com/products/one' },
+					samples: [{ text: 'One', href: 'https://example.com/products/one' }],
+					score: 40,
+				},
+			],
+			detailCandidates: [
+				{
+					url: 'https://example.com/products/one',
+					loader: 'http' as const,
+					hasJsonLdProduct: false,
+					score: 40,
+				},
+			],
+			paginationCandidates: [],
+		});
+		mocks.runWebRobotRecipe.mockResolvedValue({
+			...execution,
+			normalized: {
+				...execution.normalized,
+				products: [{ product_key: 'key:1', source_url: 'https://example.com/products/one', name: 'One' }],
+			},
+		});
+
+		const result = await authorWebRobotRecipeFromUrl({
+			projectId: 'project-id',
+			url: discovery.url,
+			env: {},
+		});
+
+		expect(result.status).toBe('ready');
+		if (result.status === 'ready') {
+			expect(result.score).toBeLessThan(70);
+			expect(result.contract.entityGranularity).toBeDefined();
+			expect(result.sourceAssessment.length).toBeGreaterThan(0);
+		}
+	});
+
+	it('does not execute or accept model recipes that match no discovered candidate', async () => {
+		mocks.discoverWebRobotSource.mockResolvedValue({ ...discovery, apiCandidates: [] });
+		mocks.generateModelRecipeCandidates.mockResolvedValue([
+			{
+				version: 2,
+				allowedHosts: ['example.com'],
+				stages: [
+					{
+						id: 'products',
+						source: { type: 'api', url: 'https://example.com/api/products' },
+						extract: {
+							type: 'json',
+							itemsPath: 'items',
+							fields: {
+								url: { path: 'url', required: true },
+								name: { path: 'name', required: true },
+								sku: { path: 'sku' },
+							},
+						},
+						output: 'product',
+					},
+				],
+			},
+		]);
+
+		const result = await authorWebRobotRecipeFromUrl({
+			projectId: 'project-id',
+			url: discovery.url,
+			env: {},
+		});
+
+		expect(mocks.generateModelRecipeCandidates).toHaveBeenCalled();
+		expect(mocks.runWebRobotRecipe).not.toHaveBeenCalled();
+		expect(result.status).toBe('rejected');
+		expect(result.diagnostics.candidates.some((candidate) => candidate.strategy === 'model')).toBe(true);
+		expect(result.diagnostics.candidates.every((candidate) => candidate.status === 'rejected')).toBe(true);
 	});
 
 	it('rejects candidates that produce no products', async () => {
@@ -390,6 +558,57 @@ describe('web robot URL authoring', () => {
 		);
 	});
 
+	it('returns rate_limited when discovery fails on a 429', async () => {
+		mocks.discoverWebRobotSource.mockRejectedValue(
+			new WebRobotLoadError('HTTP 429 while fetching request target', [
+				{
+					attempt: 0,
+					startedAt: '2026-01-01T00:00:00.000Z',
+					completedAt: '2026-01-01T00:00:01.000Z',
+					status: 429,
+				},
+			]),
+		);
+
+		const result = await authorWebRobotRecipeFromUrl({
+			projectId: 'project-id',
+			url: discovery.url,
+			env: {},
+		});
+
+		expect(result.status).toBe('rate_limited');
+		expect(result.reason).toBe(
+			'The catalogue was detected, but the source rate-limited verification. Wait a few minutes and try again.',
+		);
+		expect(mocks.runWebRobotRecipe).not.toHaveBeenCalled();
+		expect(mocks.generateModelRecipeCandidates).not.toHaveBeenCalled();
+	});
+
+	it('returns rate_limited when discovery reports a rate_limited blocker', async () => {
+		mocks.discoverWebRobotSource.mockResolvedValue({
+			...discovery,
+			apiCandidates: [],
+			blockers: [
+				{
+					kind: 'rate_limited' as const,
+					loader: 'http' as const,
+					status: 429,
+					message: 'The source is rate limiting requests.',
+				},
+			],
+		});
+
+		const result = await authorWebRobotRecipeFromUrl({
+			projectId: 'project-id',
+			url: discovery.url,
+			env: {},
+		});
+
+		expect(result.status).toBe('rate_limited');
+		expect(mocks.runWebRobotRecipe).not.toHaveBeenCalled();
+		expect(mocks.generateModelRecipeCandidates).not.toHaveBeenCalled();
+	});
+
 	it('rejects unstable product identities and extraction failures', () => {
 		const recipe = webRobotRecipeSchema.parse({
 			version: 1,
@@ -407,7 +626,19 @@ describe('web robot URL authoring', () => {
 		expect(
 			scoreExecution(recipe, {
 				...execution,
-				normalized: { products: [{ product_key: 'record:abc', name: 'One' }], attributes: [], documents: [] },
+				normalized: {
+					products: [{ product_key: 'record:abc', name: 'One' }],
+					attributes: [],
+					documents: [],
+					identityMetrics: {
+						totalEntities: 1,
+						configuredFieldUsage: {},
+						fallbackUrlCount: 0,
+						recordHashFallbackCount: 1,
+						collisionCount: 0,
+						collisions: [],
+					},
+				},
 			}).reason,
 		).toContain('stable product identity');
 	});

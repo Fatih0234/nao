@@ -23,6 +23,7 @@ const discovery = (): WebRobotSourceDiscovery => ({
 	domCandidates: [],
 	detailCandidates: [],
 	paginationCandidates: [],
+	pageContext: { headings: [], breadcrumbs: [], activeFilters: {}, displayedCounts: [] },
 	browserActionCandidates: [],
 	blockers: [],
 	warnings: [],
@@ -236,6 +237,7 @@ describe('web robot source discovery', () => {
 			itemCount: 2,
 			productUrls: [],
 			sample: {},
+			samples: [],
 			score: 80,
 		});
 		source.browserActionCandidates.push({
@@ -278,6 +280,7 @@ describe('web robot source discovery', () => {
 			},
 			productUrls: ['https://example.com/p/a', 'https://example.com/p/b'],
 			sample: { text: 'Product A', href: 'https://example.com/p/a' },
+			samples: [{ text: 'Product A', href: 'https://example.com/p/a' }],
 			score: 80,
 		});
 		source.paginationCandidates.push({ type: 'scroll', waitMs: 800, observed: true });
@@ -295,6 +298,443 @@ describe('web robot source discovery', () => {
 				{ type: 'delay', ms: 1_000 },
 			],
 		});
+	});
+
+	it('still inspects with a browser when a referenced endpoint returns arbitrary locale metadata', async () => {
+		vi.mocked(loadHttpSource).mockImplementation(async (source) => {
+			const url = source.url;
+			if (url === 'https://example.com/products') {
+				return {
+					url,
+					finalUrl: url,
+					status: 200,
+					contentType: 'text/html',
+					bodyText: '<main><div id="app"></div><script src="/app.js"></script></main>',
+					captures: [],
+					requests: 1,
+				};
+			}
+			if (url === 'https://example.com/app.js') {
+				return {
+					url,
+					finalUrl: url,
+					status: 200,
+					contentType: 'text/javascript',
+					bodyText: `fetch('/api/locales')`,
+					captures: [],
+					requests: 1,
+				};
+			}
+			if (url === 'https://example.com/api/locales') {
+				return {
+					url,
+					finalUrl: url,
+					status: 200,
+					contentType: 'application/json',
+					bodyText: JSON.stringify({
+						locales: [
+							{ name: 'English', code: 'en', url: 'https://example.com/en' },
+							{ name: 'Deutsch', code: 'de', url: 'https://example.com/de' },
+						],
+					}),
+					bodyJson: {
+						locales: [
+							{ name: 'English', code: 'en', url: 'https://example.com/en' },
+							{ name: 'Deutsch', code: 'de', url: 'https://example.com/de' },
+						],
+					},
+					captures: [],
+					requests: 1,
+				};
+			}
+			return {
+				url,
+				finalUrl: url,
+				status: 200,
+				contentType: 'text/html',
+				bodyText: '<main></main>',
+				captures: [],
+				requests: 1,
+			};
+		});
+		const load = vi.spyOn(WebRobotBrowserSession.prototype, 'load').mockResolvedValue({
+			url: 'https://example.com/products',
+			finalUrl: 'https://example.com/products',
+			status: 200,
+			contentType: 'text/html',
+			bodyText:
+				'<main><div class="product"><a href="/products/a">Product A</a></div><div class="product"><a href="/products/b">Product B</a></div></main>',
+			captures: [],
+			requests: 1,
+		});
+		vi.spyOn(WebRobotBrowserSession.prototype, 'probePagination').mockResolvedValue({});
+
+		const result = await discoverWebRobotSource({ url: 'https://example.com/products', env: {} });
+
+		expect(load).toHaveBeenCalled();
+		expect(result.apiCandidates.length).toBeGreaterThan(0);
+		expect(result.domCandidates.length).toBeGreaterThan(0);
+	});
+
+	it('still inspects with a browser when a displayed count does not match the candidate item count', async () => {
+		vi.mocked(loadHttpSource).mockImplementation(async (source) => {
+			const url = source.url;
+			if (url === 'https://example.com/products') {
+				return {
+					url,
+					finalUrl: url,
+					status: 200,
+					contentType: 'text/html',
+					bodyText:
+						'<main><p class="woocommerce-result-count">Showing all 9 results</p><script src="/app.js"></script></main>',
+					captures: [],
+					requests: 1,
+				};
+			}
+			if (url === 'https://example.com/app.js') {
+				return {
+					url,
+					finalUrl: url,
+					status: 200,
+					contentType: 'text/javascript',
+					bodyText: `fetch('/api/products')`,
+					captures: [],
+					requests: 1,
+				};
+			}
+			if (url === 'https://example.com/api/products') {
+				const items = Array.from({ length: 13 }, (_, index) => ({
+					name: `Product ${index}`,
+					url: `/products/${index}`,
+					sku: `SKU-${index}`,
+				}));
+				return {
+					url,
+					finalUrl: url,
+					status: 200,
+					contentType: 'application/json',
+					bodyText: JSON.stringify({ items }),
+					bodyJson: { items },
+					captures: [],
+					requests: 1,
+				};
+			}
+			return {
+				url,
+				finalUrl: url,
+				status: 200,
+				contentType: 'text/html',
+				bodyText: '<main></main>',
+				captures: [],
+				requests: 1,
+			};
+		});
+		const load = vi.spyOn(WebRobotBrowserSession.prototype, 'load').mockResolvedValue({
+			url: 'https://example.com/products',
+			finalUrl: 'https://example.com/products',
+			status: 200,
+			contentType: 'text/html',
+			bodyText:
+				'<main><div class="product"><a href="/products/a">Product A</a></div><div class="product"><a href="/products/b">Product B</a></div></main>',
+			captures: [],
+			requests: 1,
+		});
+		vi.spyOn(WebRobotBrowserSession.prototype, 'probePagination').mockResolvedValue({});
+
+		const result = await discoverWebRobotSource({ url: 'https://example.com/products', env: {} });
+
+		expect(result.apiCandidates[0]?.itemCount).toBe(13);
+		expect(result.pageContext.displayedCounts[0]).toMatchObject({ value: 9, kind: 'all_results' });
+		expect(load).toHaveBeenCalled();
+	});
+
+	it('never emits unobserved load-more controls into generated recipes', () => {
+		const source = discovery();
+		source.domCandidates.push({
+			loader: 'browser',
+			itemSelector: '.product',
+			itemCount: 2,
+			productUrlCount: 2,
+			fields: {
+				url: { selector: 'a', attr: 'href', required: true, transforms: ['absoluteUrl'] },
+				name: { selector: 'a', required: true, transforms: ['normalizeWhitespace'] },
+			},
+			productUrls: ['https://example.com/p/a', 'https://example.com/p/b'],
+			sample: { text: 'Product A', href: 'https://example.com/p/a' },
+			samples: [{ text: 'Product A', href: 'https://example.com/p/a' }],
+			score: 80,
+		});
+		source.paginationCandidates.push({
+			type: 'click',
+			selector: 'button.show-more',
+			observed: false,
+		});
+
+		const recipes = generateDeterministicCandidates(source).map((candidate) =>
+			webRobotRecipeSchema.parse(candidate.recipe),
+		);
+
+		expect(recipes.length).toBeGreaterThan(0);
+		expect(recipes.every((recipe) => recipe.stages.every((stage) => stage.paginate?.type !== 'click'))).toBe(true);
+	});
+
+	it('decodes HTML entities in endpoint URLs and never probes facet navigation links', async () => {
+		vi.spyOn(WebRobotBrowserSession.prototype, 'load').mockRejectedValue(new Error('no browser'));
+		vi.mocked(loadHttpSource).mockImplementation(async (source) => {
+			const url = source.url;
+			if (url === 'https://example.com/products') {
+				return {
+					url,
+					finalUrl: url,
+					status: 200,
+					contentType: 'text/html',
+					bodyText: `<main>
+						<div class="product"><a href="/p/a">Product A</a></div>
+						<a href="/catalog?yith_wcan=1&amp;product_cat=pumps&amp;filter_material=steel">Steel pumps</a>
+						<a href="/catalog?yith_wcan=1&amp;product_cat=pumps&amp;filter_material=iron">Iron pumps</a>
+						<script>
+							fetch('/api/facets?yith_wcan=1&amp;product_cat=pumps&amp;filter_material=steel&#38;page=1')
+							fetch('/wp-admin/admin-ajax.php?action=load_items')
+						</script>
+					</main>`,
+					captures: [],
+					requests: 1,
+				};
+			}
+			if (url.startsWith('https://example.com/wp-admin/admin-ajax.php')) {
+				return {
+					url,
+					finalUrl: url,
+					status: 200,
+					contentType: 'application/json',
+					bodyText: JSON.stringify({ items: [{ name: 'Product A', url: '/p/a' }] }),
+					bodyJson: { items: [{ name: 'Product A', url: '/p/a' }] },
+					captures: [],
+					requests: 1,
+				};
+			}
+			if (url.startsWith('https://example.com/api/facets')) {
+				return {
+					url,
+					finalUrl: url,
+					status: 200,
+					contentType: 'application/json',
+					bodyText: JSON.stringify({ items: [{ name: 'Product A', url: '/p/a' }] }),
+					bodyJson: { items: [{ name: 'Product A', url: '/p/a' }] },
+					captures: [],
+					requests: 1,
+				};
+			}
+			return {
+				url,
+				finalUrl: url,
+				status: 200,
+				contentType: 'text/html',
+				bodyText: '<main></main>',
+				captures: [],
+				requests: 1,
+			};
+		});
+
+		const result = await discoverWebRobotSource({ url: 'https://example.com/products', env: {} });
+
+		const facetEndpoint = result.endpointCandidates.find((candidate) => candidate.url.includes('/api/facets'));
+		expect(facetEndpoint).toBeDefined();
+		const keys = [...new URL(facetEndpoint!.url).searchParams.keys()];
+		expect(keys).toEqual(expect.arrayContaining(['yith_wcan', 'product_cat', 'filter_material', 'page']));
+		expect(keys.some((key) => key.startsWith('amp;'))).toBe(false);
+
+		expect(result.endpointCandidates.some((candidate) => candidate.url.includes('/catalog'))).toBe(false);
+		expect(result.endpointCandidates.some((candidate) => candidate.url.includes('admin-ajax.php'))).toBe(true);
+		const probedUrls = vi.mocked(loadHttpSource).mock.calls.map(([source]) => source.url);
+		expect(probedUrls.some((url) => url.includes('/catalog'))).toBe(false);
+	});
+
+	it('infers membership categories instead of descriptions from card category paragraphs', async () => {
+		vi.spyOn(WebRobotBrowserSession.prototype, 'load').mockRejectedValue(new Error('no browser'));
+		vi.mocked(loadHttpSource).mockImplementation(async (source) => {
+			const url = source.url;
+			if (url === 'https://example.com/products') {
+				return {
+					url,
+					finalUrl: url,
+					status: 200,
+					contentType: 'text/html',
+					bodyText: `<main>
+						<div class="prodotto-card"><a href="/p/pump-a">Pump A</a><p class="prodotto-card-cat text-uppercase">Peripheral pumps</p></div>
+						<div class="prodotto-card"><a href="/p/pump-b">Pump B</a><p class="prodotto-card-cat text-uppercase">Peripheral pumps</p></div>
+					</main>`,
+					captures: [],
+					requests: 1,
+				};
+			}
+			return {
+				url,
+				finalUrl: url,
+				status: 200,
+				contentType: 'text/html',
+				bodyText: '<main><h1>Pump detail</h1></main>',
+				captures: [],
+				requests: 1,
+			};
+		});
+
+		const result = await discoverWebRobotSource({ url: 'https://example.com/products', env: {} });
+
+		const candidate = result.domCandidates.find((entry) => entry.loader === 'http' && entry.fields.categories);
+		expect(candidate).toBeDefined();
+		expect(candidate!.fields.categories?.multiple).toBe(true);
+		expect(candidate!.fields.categories?.selector).toMatch(/cat/i);
+		expect(candidate!.fields.description).toBeUndefined();
+
+		const recipes = generateDeterministicCandidates(result).map((entry) =>
+			webRobotRecipeSchema.parse(entry.recipe),
+		);
+		const extracts = recipes.flatMap((recipe) => recipe.stages.map((stage) => stage.extract));
+		const listing = extracts.find((extract) => extract?.type === 'dom' && 'categories' in extract.fields);
+		expect(listing?.type === 'dom' && listing.fields.categories).toMatchObject({ multiple: true });
+	});
+
+	it('carries declared page and item totals on pagination candidates', async () => {
+		vi.spyOn(WebRobotBrowserSession.prototype, 'load').mockRejectedValue(new Error('no browser'));
+		vi.mocked(loadHttpSource).mockImplementation(async (source) => {
+			const url = source.url;
+			if (url === 'https://example.com/products') {
+				return {
+					url,
+					finalUrl: url,
+					status: 200,
+					contentType: 'text/html',
+					bodyText: `<main><script>fetch('/api/products?page=1')</script></main>`,
+					captures: [],
+					requests: 1,
+				};
+			}
+			if (url === 'https://example.com/api/products?page=1') {
+				const items = [
+					{ name: 'Product A', url: '/p/a', sku: 'A-1' },
+					{ name: 'Product B', url: '/p/b', sku: 'B-2' },
+				];
+				return {
+					url,
+					finalUrl: url,
+					status: 200,
+					contentType: 'application/json',
+					bodyText: JSON.stringify({ items, numberOfPages: 7, totalNumberOfResults: 34 }),
+					bodyJson: { items, numberOfPages: 7, totalNumberOfResults: 34 },
+					captures: [],
+					requests: 1,
+				};
+			}
+			return {
+				url,
+				finalUrl: url,
+				status: 200,
+				contentType: 'text/html',
+				bodyText: '<main></main>',
+				captures: [],
+				requests: 1,
+			};
+		});
+
+		const result = await discoverWebRobotSource({ url: 'https://example.com/products', env: {} });
+
+		expect(result.paginationCandidates).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					type: 'page',
+					totalPagesPath: 'numberOfPages',
+					declaredPages: 7,
+					totalItemsPath: 'totalNumberOfResults',
+					declaredItems: 34,
+				}),
+			]),
+		);
+	});
+
+	it('keeps a page-parametrised endpoint on page pagination when only an item total is declared', async () => {
+		vi.spyOn(WebRobotBrowserSession.prototype, 'load').mockRejectedValue(new Error('no browser'));
+		vi.mocked(loadHttpSource).mockImplementation(async (source) => {
+			const url = source.url;
+			if (url === 'https://example.com/products') {
+				return {
+					url,
+					finalUrl: url,
+					status: 200,
+					contentType: 'text/html',
+					bodyText: `<main><script>fetch('/api/products?page=1')</script></main>`,
+					captures: [],
+					requests: 1,
+				};
+			}
+			if (url === 'https://example.com/api/products?page=1') {
+				const items = [
+					{ name: 'Product A', url: '/p/a', sku: 'A-1' },
+					{ name: 'Product B', url: '/p/b', sku: 'B-2' },
+				];
+				return {
+					url,
+					finalUrl: url,
+					status: 200,
+					contentType: 'application/json',
+					bodyText: JSON.stringify({ items, totalNumberOfResults: 34 }),
+					bodyJson: { items, totalNumberOfResults: 34 },
+					captures: [],
+					requests: 1,
+				};
+			}
+			return {
+				url,
+				finalUrl: url,
+				status: 200,
+				contentType: 'text/html',
+				bodyText: '<main></main>',
+				captures: [],
+				requests: 1,
+			};
+		});
+
+		const result = await discoverWebRobotSource({ url: 'https://example.com/products', env: {} });
+
+		expect(result.paginationCandidates.some((candidate) => candidate.type === 'offset')).toBe(false);
+		expect(result.paginationCandidates).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					type: 'page',
+					pageVariable: 'page',
+					totalItemsPath: 'totalNumberOfResults',
+					declaredItems: 34,
+				}),
+			]),
+		);
+	});
+
+	it('adds a rate_limited blocker and stops network work when the browser sees a 429', async () => {
+		vi.spyOn(WebRobotBrowserSession.prototype, 'load').mockResolvedValue({
+			url: 'https://example.com/products',
+			finalUrl: 'https://example.com/products',
+			status: 429,
+			captures: [],
+			requests: 1,
+		});
+		vi.spyOn(WebRobotBrowserSession.prototype, 'close').mockResolvedValue(undefined);
+		vi.mocked(loadHttpSource).mockResolvedValue({
+			url: 'https://example.com/products',
+			finalUrl: 'https://example.com/products',
+			status: 200,
+			contentType: 'text/html',
+			bodyText:
+				'<main><div class="product"><a href="/p/a">Product A</a></div><div class="product"><a href="/p/b">Product B</a></div></main>',
+			captures: [],
+			requests: 1,
+		});
+
+		const result = await discoverWebRobotSource({ url: 'https://example.com/products', env: {} });
+
+		expect(result.blockers).toEqual(
+			expect.arrayContaining([expect.objectContaining({ kind: 'rate_limited', loader: 'http', status: 429 })]),
+		);
+		expect(vi.mocked(loadHttpSource)).toHaveBeenCalledTimes(1);
 	});
 });
 

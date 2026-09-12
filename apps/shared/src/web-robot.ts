@@ -1,6 +1,7 @@
 import { z } from 'zod/v4';
 
-export const WEB_ROBOT_RECIPE_VERSION = 1;
+export const WEB_ROBOT_RECIPE_V1_VERSION = 1;
+export const WEB_ROBOT_RECIPE_VERSION = 2;
 
 const hostnameSchema = z
 	.string()
@@ -246,6 +247,7 @@ const paginationSchema = z.discriminatedUnion('type', [
 		pageVariable: z.string().trim().min(1).max(128).default('page'),
 		firstPage: z.number().int().min(0).default(1),
 		totalPagesPath: jsonPathSchema.optional(),
+		totalItemsPath: jsonPathSchema.optional(),
 		maxPages: z.number().int().min(1).max(10_000).default(100),
 	}),
 	z.object({
@@ -366,100 +368,125 @@ const stageSchema = z
 		}
 	});
 
-export const webRobotRecipeSchema = z
-	.object({
-		version: z.literal(WEB_ROBOT_RECIPE_VERSION),
-		allowedHosts: z.array(hostnameSchema).min(1).max(32),
-		request: z
-			.object({
-				concurrency: z.number().int().min(1).max(4).default(1),
-				delayMs: z.number().int().min(0).max(60_000).default(500),
-				timeoutMs: z.number().int().min(100).max(120_000).default(20_000),
-				retries: z.number().int().min(0).max(5).default(2),
-				userAgent: z.string().trim().max(512).optional(),
-			})
-			.default({ concurrency: 1, delayMs: 500, timeoutMs: 20_000, retries: 2 }),
-		limits: z
-			.object({
-				maxPages: z.number().int().min(1).max(10_000).default(500),
-				maxItems: z.number().int().min(1).max(100_000).default(10_000),
-				maxRequests: z.number().int().min(1).max(50_000).default(5_000),
-				maxDurationMs: z
-					.number()
-					.int()
-					.min(1_000)
-					.max(4 * 60 * 60_000)
-					.default(30 * 60_000),
-				maxResponseBytes: z
-					.number()
-					.int()
-					.min(1024)
-					.max(50 * 1024 * 1024)
-					.default(5 * 1024 * 1024),
-			})
-			.default({
-				maxPages: 500,
-				maxItems: 10_000,
-				maxRequests: 5_000,
-				maxDurationMs: 30 * 60_000,
-				maxResponseBytes: 5 * 1024 * 1024,
-			}),
-		publish: z
-			.object({
-				minItems: z.number().int().min(0).max(100_000).default(1),
-				maxRemovedPercent: z.number().min(0).max(100).default(50),
-			})
-			.default({ minItems: 1, maxRemovedPercent: 50 }),
-		identity: z
-			.object({
-				fields: z.array(z.string().trim().min(1).max(128)).min(1).max(8).default(['sku', 'url']),
-			})
-			.default({ fields: ['sku', 'url'] }),
-		respectRobotsTxt: z.boolean().default(false),
-		stages: z.array(stageSchema).min(1).max(64),
-	})
-	.superRefine((recipe, ctx) => {
-		const stageIds = new Set<string>();
-		const streamNames = new Set<string>();
-		for (const [index, stage] of recipe.stages.entries()) {
-			if (stageIds.has(stage.id)) {
-				ctx.addIssue({
-					code: 'custom',
-					message: `Duplicate stage id '${stage.id}'`,
-					path: ['stages', index, 'id'],
-				});
-			}
-			stageIds.add(stage.id);
+const recipeCommonShape = {
+	allowedHosts: z.array(hostnameSchema).min(1).max(32),
+	request: z
+		.object({
+			concurrency: z.number().int().min(1).max(4).default(1),
+			delayMs: z.number().int().min(0).max(60_000).default(500),
+			timeoutMs: z.number().int().min(100).max(120_000).default(20_000),
+			retries: z.number().int().min(0).max(5).default(2),
+			userAgent: z.string().trim().max(512).optional(),
+		})
+		.default({ concurrency: 1, delayMs: 500, timeoutMs: 20_000, retries: 2 }),
+	limits: z
+		.object({
+			maxPages: z.number().int().min(1).max(10_000).default(500),
+			maxItems: z.number().int().min(1).max(100_000).default(10_000),
+			maxRequests: z.number().int().min(1).max(50_000).default(5_000),
+			maxDurationMs: z
+				.number()
+				.int()
+				.min(1_000)
+				.max(4 * 60 * 60_000)
+				.default(30 * 60_000),
+			maxResponseBytes: z
+				.number()
+				.int()
+				.min(1024)
+				.max(50 * 1024 * 1024)
+				.default(5 * 1024 * 1024),
+		})
+		.default({
+			maxPages: 500,
+			maxItems: 10_000,
+			maxRequests: 5_000,
+			maxDurationMs: 30 * 60_000,
+			maxResponseBytes: 5 * 1024 * 1024,
+		}),
+	publish: z
+		.object({
+			minItems: z.number().int().min(0).max(100_000).default(1),
+			maxRemovedPercent: z.number().min(0).max(100).default(50),
+		})
+		.default({ minItems: 1, maxRemovedPercent: 50 }),
+	respectRobotsTxt: z.boolean().default(false),
+	stages: z.array(stageSchema).min(1).max(64),
+};
 
-			if (stage.forEach && !streamNames.has(stage.forEach.from)) {
-				ctx.addIssue({
-					code: 'custom',
-					message: `Stage '${stage.id}' references unknown or later stage '${stage.forEach.from}'`,
-					path: ['stages', index, 'forEach', 'from'],
-				});
-			}
+const recipeIdentityFieldsSchema = z.array(z.string().trim().min(1).max(128)).min(1).max(8).default(['sku', 'url']);
 
-			const streamName = stage.emit ?? stage.id;
-			if (streamNames.has(streamName)) {
-				ctx.addIssue({
-					code: 'custom',
-					message: `Duplicate stage stream '${streamName}'`,
-					path: ['stages', index, 'emit'],
-				});
-			}
-			streamNames.add(streamName);
-		}
-
-		if (!recipe.stages.some((stage) => stage.output === 'product')) {
+const validateRecipeStages = (recipe: { stages: WebRobotStage[] }, ctx: z.RefinementCtx) => {
+	const stageIds = new Set<string>();
+	const streamNames = new Set<string>();
+	for (const [index, stage] of recipe.stages.entries()) {
+		if (stageIds.has(stage.id)) {
 			ctx.addIssue({
 				code: 'custom',
-				message: 'At least one stage must set output to product',
-				path: ['stages'],
+				message: `Duplicate stage id '${stage.id}'`,
+				path: ['stages', index, 'id'],
 			});
 		}
-	});
+		stageIds.add(stage.id);
+
+		if (stage.forEach && !streamNames.has(stage.forEach.from)) {
+			ctx.addIssue({
+				code: 'custom',
+				message: `Stage '${stage.id}' references unknown or later stage '${stage.forEach.from}'`,
+				path: ['stages', index, 'forEach', 'from'],
+			});
+		}
+
+		const streamName = stage.emit ?? stage.id;
+		if (streamNames.has(streamName)) {
+			ctx.addIssue({
+				code: 'custom',
+				message: `Duplicate stage stream '${streamName}'`,
+				path: ['stages', index, 'emit'],
+			});
+		}
+		streamNames.add(streamName);
+	}
+
+	if (!recipe.stages.some((stage) => stage.output === 'product')) {
+		ctx.addIssue({
+			code: 'custom',
+			message: 'At least one stage must set output to product',
+			path: ['stages'],
+		});
+	}
+};
+
+export const webRobotRecipeV1Schema = z
+	.object({
+		version: z.literal(WEB_ROBOT_RECIPE_V1_VERSION),
+		...recipeCommonShape,
+		identity: z
+			.object({
+				fields: recipeIdentityFieldsSchema,
+			})
+			.default({ fields: ['sku', 'url'] }),
+	})
+	.superRefine(validateRecipeStages);
+
+export const webRobotRecipeV2Schema = z
+	.object({
+		version: z.literal(WEB_ROBOT_RECIPE_VERSION),
+		...recipeCommonShape,
+		identity: z
+			.object({
+				strategy: z.literal('first_present'),
+				fields: recipeIdentityFieldsSchema,
+			})
+			.default({ strategy: 'first_present', fields: ['sku', 'url'] }),
+	})
+	.superRefine(validateRecipeStages);
+
+export const webRobotRecipeSchema = z.union([webRobotRecipeV1Schema, webRobotRecipeV2Schema]);
 
 export type WebRobotRecipe = z.infer<typeof webRobotRecipeSchema>;
+export type WebRobotRecipeV1 = z.infer<typeof webRobotRecipeV1Schema>;
+export type WebRobotRecipeV2 = z.infer<typeof webRobotRecipeV2Schema>;
 export type WebRobotStage = z.infer<typeof stageSchema>;
 export type WebRobotSource = z.infer<typeof sourceSchema>;
 export type WebRobotExtract = z.infer<typeof extractSchema>;

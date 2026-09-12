@@ -2,7 +2,15 @@ import { Editor } from '@monaco-editor/react';
 
 import { useEditorTheme } from '@/hooks/use-editor-theme';
 
-export function WebSourceRecipeEditor({ value, onChange }: { value: string; onChange: (value: string) => void }) {
+export function WebSourceRecipeEditor({
+	value,
+	onChange,
+	readOnly = false,
+}: {
+	value: string;
+	onChange: (value: string) => void;
+	readOnly?: boolean;
+}) {
 	const editorTheme = useEditorTheme();
 
 	return (
@@ -20,6 +28,7 @@ export function WebSourceRecipeEditor({ value, onChange }: { value: string; onCh
 					scrollBeyondLastLine: false,
 					wordWrap: 'on',
 					tabSize: 2,
+					readOnly,
 					automaticLayout: true,
 				}}
 			/>

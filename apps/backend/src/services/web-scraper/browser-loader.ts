@@ -3,10 +3,20 @@ import type { Browser, ElementHandle, HTTPRequest, HTTPResponse, Page } from 'pu
 
 import { env } from '../../env';
 import { browserLaunchArgs, findChromePath } from '../../utils/headless-browser';
-import { headersForOrigin, resolveHeaders } from './request';
+import { delay, headersForOrigin, resolveHeaders } from './request';
 import type { TemplateScope } from './template';
 import { renderStringTemplate, renderTemplate } from './template';
-import type { WebRobotCapturedResponse, WebRobotLoadedSource, WebRobotRunWarning } from './types';
+import { responseFingerprint } from './traversal-evidence';
+import type {
+	ClickPagination,
+	WebRobotBrowserControlState,
+	WebRobotBrowserScrollState,
+	WebRobotBrowserTraversalSnapshot,
+	WebRobotCapturedResponse,
+	WebRobotInteractiveBrowser,
+	WebRobotLoadedSource,
+	WebRobotRunWarning,
+} from './types';
 import { assertPublicHttpUrl } from './url-policy';
 
 type BrowserSource = Extract<WebRobotSource, { type: 'browser' }>;
@@ -19,7 +29,6 @@ export type BrowserLoaderOptions = {
 	onWarning?: (warning: WebRobotRunWarning) => void;
 };
 
-type ClickPagination = Extract<NonNullable<WebRobotStage['paginate']>, { type: 'click' }>;
 type ScrollPagination = Extract<NonNullable<WebRobotStage['paginate']>, { type: 'scroll' }>;
 type InteractivePagination = ClickPagination | ScrollPagination;
 
@@ -33,15 +42,16 @@ export type WebRobotPaginationObservation = {
 type OpenBrowserPage = {
 	page: Page;
 	url: string;
-	status: number;
-	contentType?: string;
 	captures: WebRobotCapturedResponse[];
 	pendingCaptures: Set<Promise<void>>;
 	requestCount: () => number;
+	relevantCount: () => number;
+	captureLimitReached: () => boolean;
+	main: { status: number; contentType?: string };
 };
 
 const ALLOWED_RESOURCE_TYPES = new Set(['document', 'script', 'xhr', 'fetch', 'stylesheet', 'eventsource']);
-const MAX_CAPTURED_RESPONSES = 32;
+const MAX_CAPTURED_RESPONSES = 512;
 const MAX_CAPTURED_REQUEST_BYTES = 128 * 1024;
 
 class BrowserLoadLimiter {
@@ -157,6 +167,146 @@ export class WebRobotBrowserSession {
 		} finally {
 			release();
 		}
+	}
+
+	async openInteractive(source: BrowserSource, options: BrowserLoaderOptions): Promise<WebRobotInteractiveBrowser> {
+		const release = await browserLoadLimiter.acquire(options.signal);
+		let opened: OpenBrowserPage;
+		try {
+			opened = await this.openPage(source, options);
+		} catch (error) {
+			release();
+			throw error;
+		}
+
+		let requestOffset = 0;
+		let captureOffset = 0;
+		let closed = false;
+
+		const scrollState = async (): Promise<WebRobotBrowserScrollState> => {
+			const state = await readScrollState(opened.page);
+			await Promise.all(opened.pendingCaptures);
+			return { ...state, relevantNetworkIdle: opened.relevantCount() === 0 };
+		};
+
+		const observeStability = async (): Promise<{ textLength: number; scrollExtent: number }> =>
+			opened.page.evaluate(`${EFFECTIVE_SCROLL_TARGET}
+				const target = effectiveScrollTarget();
+				return {
+					textLength: document.body?.innerText.length ?? 0,
+					scrollExtent: target.scrollHeight,
+				};`) as Promise<{ textLength: number; scrollExtent: number }>;
+
+		return {
+			snapshot: async (pagination?: ClickPagination): Promise<WebRobotBrowserTraversalSnapshot> => {
+				throwIfAborted(options.signal);
+				const result = await this.snapshotPage(opened, requestOffset, captureOffset);
+				requestOffset = result.requestOffset;
+				captureOffset = result.captureOffset;
+				const loaded = result.loaded;
+				loaded.responseFingerprint = responseFingerprint(loaded);
+				const scroll = await scrollState();
+				const control = pagination ? await this.inspectInteractiveControl(opened, pagination) : undefined;
+				return { loaded, control, scroll };
+			},
+			inspectControl: (pagination: ClickPagination) => this.inspectInteractiveControl(opened, pagination),
+			click: async (pagination: ClickPagination): Promise<WebRobotBrowserControlState> => {
+				throwIfAborted(options.signal);
+				const state = await this.inspectInteractiveControl(opened, pagination);
+				if (!state.present || !state.enabled) {
+					return state;
+				}
+				if (state.relocated) {
+					const relocated = await this.fingerprintControl(opened.page, pagination.fingerprint);
+					try {
+						await relocated?.click();
+					} finally {
+						await relocated?.dispose();
+					}
+					return state;
+				}
+				const control = state.selector ? await opened.page.$(state.selector) : null;
+				try {
+					await control?.click();
+				} finally {
+					await control?.dispose();
+				}
+				return state;
+			},
+			scrollIncrement: async (): Promise<void> => {
+				throwIfAborted(options.signal);
+				await opened.page.evaluate(`${EFFECTIVE_SCROLL_TARGET}
+					const target = effectiveScrollTarget();
+					target.scrollTop += Math.max(1, Math.floor(target.clientHeight * 0.75));`);
+			},
+			settle: async (waitMs: number): Promise<void> => {
+				throwIfAborted(options.signal);
+				if (waitMs > 0) {
+					await delay(waitMs, options.signal);
+				}
+				const deadline = Date.now() + 2_000;
+				let previous = await observeStability();
+				while (Date.now() < deadline) {
+					throwIfAborted(options.signal);
+					await delay(100, options.signal);
+					await Promise.all(opened.pendingCaptures);
+					const next = await observeStability();
+					if (
+						opened.relevantCount() === 0 &&
+						next.textLength === previous.textLength &&
+						next.scrollExtent === previous.scrollExtent
+					) {
+						return;
+					}
+					previous = next;
+				}
+			},
+			close: async (): Promise<void> => {
+				if (closed) {
+					return;
+				}
+				closed = true;
+				await opened.page.close().catch(() => undefined);
+				release();
+			},
+		};
+	}
+
+	private async inspectInteractiveControl(
+		opened: OpenBrowserPage,
+		pagination: ClickPagination,
+	): Promise<WebRobotBrowserControlState> {
+		for (const selector of [pagination.selector, ...(pagination.selectors ?? [])]) {
+			const control = await opened.page.$(selector);
+			if (!control) {
+				continue;
+			}
+			const disabled = await control.evaluate(
+				(element) =>
+					element.hasAttribute('disabled') ||
+					element.getAttribute('aria-disabled') === 'true' ||
+					Array.from(element.classList).some((name) => name.includes('disabled')),
+			);
+			await control.dispose();
+			return { present: true, enabled: !disabled, selector };
+		}
+		const relocated = await this.fingerprintControl(opened.page, pagination.fingerprint);
+		if (!relocated) {
+			return { present: false, enabled: false };
+		}
+		const disabled = await relocated.evaluate(
+			(element) =>
+				element.hasAttribute('disabled') ||
+				element.getAttribute('aria-disabled') === 'true' ||
+				Array.from(element.classList).some((name) => name.includes('disabled')),
+		);
+		await relocated.dispose();
+		return {
+			present: true,
+			enabled: !disabled,
+			relocated: true,
+			selector: `fingerprint:${pagination.fingerprint?.tag ?? 'control'}`,
+		};
 	}
 
 	private async loadPage(source: BrowserSource, options: BrowserLoaderOptions): Promise<WebRobotLoadedSource> {
@@ -295,8 +445,8 @@ export class WebRobotBrowserSession {
 			waitUntil: 'domcontentloaded',
 			timeout: options.recipe.request.timeoutMs,
 		});
-		opened.status = response?.status() ?? opened.status;
-		opened.contentType = response?.headers()['content-type'] ?? opened.contentType;
+		opened.main.status = response?.status() ?? opened.main.status;
+		opened.main.contentType = response?.headers()['content-type'] ?? opened.main.contentType;
 		for (const action of source.actions) {
 			await runAction(opened.page, action, options.recipe.request.timeoutMs);
 		}
@@ -326,11 +476,11 @@ export class WebRobotBrowserSession {
 		const browser = await this.browser();
 		const page = await browser.newPage();
 		const captures: WebRobotCapturedResponse[] = [];
-		const captureBudget = { count: 0 };
+		const captureBudget = { count: 0, reached: false };
 		const pendingCaptures = new Set<Promise<void>>();
+		const relevantRequests = new Set<HTTPRequest>();
+		const main: { status: number; contentType?: string } = { status: 0 };
 		let requests = 0;
-		let mainStatus = 0;
-		let contentType: string | undefined;
 
 		try {
 			await page.setViewport(rendered.viewport);
@@ -346,6 +496,11 @@ export class WebRobotBrowserSession {
 				void this.handleRequest(request, options, headers, initialOrigin).catch(() => request.abort());
 			});
 			page.on('response', (response) => {
+				const request = response.request();
+				if (request.isNavigationRequest() && response.frame() === page.mainFrame()) {
+					main.status = response.status();
+					main.contentType = response.headers()['content-type'];
+				}
 				const pending = captureResponse(
 					response,
 					rendered.capture,
@@ -357,16 +512,26 @@ export class WebRobotBrowserSession {
 					.finally(() => pendingCaptures.delete(pending));
 				pendingCaptures.add(pending);
 			});
-			page.on('request', () => {
+			page.on('request', (request) => {
 				requests += 1;
+				const resourceType = request.resourceType();
+				if (
+					(resourceType === 'xhr' || resourceType === 'fetch') &&
+					(rendered.capture.length === 0 ||
+						rendered.capture.some((rule) => matchesPattern(request.url(), rule.urlPattern)))
+				) {
+					relevantRequests.add(request);
+				}
 			});
+			page.on('requestfinished', (request) => relevantRequests.delete(request));
+			page.on('requestfailed', (request) => relevantRequests.delete(request));
 
 			const response = await page.goto(url, {
 				waitUntil: 'domcontentloaded',
 				timeout: options.recipe.request.timeoutMs,
 			});
-			mainStatus = response?.status() ?? 0;
-			contentType = response?.headers()['content-type'];
+			main.status = response?.status() ?? 0;
+			main.contentType = response?.headers()['content-type'];
 
 			for (const action of rendered.actions) {
 				throwIfAborted(options.signal);
@@ -376,11 +541,12 @@ export class WebRobotBrowserSession {
 			return {
 				page,
 				url,
-				status: mainStatus,
-				contentType,
 				captures,
 				pendingCaptures,
 				requestCount: () => requests,
+				relevantCount: () => relevantRequests.size,
+				captureLimitReached: () => captureBudget.reached,
+				main,
 			};
 		} catch (error) {
 			await page.close().catch(() => undefined);
@@ -399,11 +565,12 @@ export class WebRobotBrowserSession {
 			loaded: {
 				url: opened.url,
 				finalUrl: opened.page.url(),
-				status: opened.status,
-				contentType: opened.contentType,
+				status: opened.main.status,
+				contentType: opened.main.contentType,
 				bodyText: await opened.page.content(),
 				captures: opened.captures.slice(captureOffset),
 				requests: requestTotal - requestOffset,
+				captureLimitReached: opened.captureLimitReached() || undefined,
 			},
 			requestOffset: requestTotal,
 			captureOffset: opened.captures.length,
@@ -539,6 +706,62 @@ export class WebRobotBrowserSession {
 	}
 }
 
+const EFFECTIVE_SCROLL_TARGET = `const effectiveScrollTarget = () => {
+	const documentTarget = document.scrollingElement ?? document.documentElement;
+	let best = documentTarget;
+	let bestExtent = documentTarget.scrollHeight - documentTarget.clientHeight;
+	for (const element of Array.from(document.querySelectorAll('*'))) {
+		const style = getComputedStyle(element);
+		if (
+			(style.overflowY === 'auto' || style.overflowY === 'scroll') &&
+			element.scrollHeight > element.clientHeight
+		) {
+			const extent = element.scrollHeight - element.clientHeight;
+			if (extent > bestExtent) {
+				best = element;
+				bestExtent = extent;
+			}
+		}
+	}
+	return best;
+};`;
+
+const readScrollState = async (page: Page): Promise<Omit<WebRobotBrowserScrollState, 'relevantNetworkIdle'>> =>
+	page.evaluate(`${EFFECTIVE_SCROLL_TARGET}
+		const target = effectiveScrollTarget();
+		const viewportExtent = target.clientHeight;
+		const scrollTop = target.scrollTop;
+		const scrollExtent = target.scrollHeight;
+		const atEffectiveBottom = scrollExtent - scrollTop - viewportExtent <= Math.max(2, viewportExtent * 0.05);
+		const isVisible = (element) => element.getClientRects().length > 0;
+		const loadingIndicatorPresent = Array.from(
+			document.querySelectorAll('[aria-busy="true"],[role="progressbar"],[class*="loading" i],[class*="spinner" i]'),
+		).some(isVisible);
+		let rangeStart;
+		let rangeEnd;
+		let setSize;
+		for (const element of document.querySelectorAll('[aria-posinset]')) {
+			if (!isVisible(element)) {
+				continue;
+			}
+			const position = Number.parseInt(element.getAttribute('aria-posinset') ?? '', 10);
+			if (position > 0) {
+				rangeStart = rangeStart === undefined ? position : Math.min(rangeStart, position);
+				rangeEnd = rangeEnd === undefined ? position : Math.max(rangeEnd, position);
+			}
+		}
+		for (const element of document.querySelectorAll('[aria-setsize]')) {
+			if (!isVisible(element)) {
+				continue;
+			}
+			const size = Number.parseInt(element.getAttribute('aria-setsize') ?? '', 10);
+			if (size > 0) {
+				setSize = setSize === undefined ? size : Math.max(setSize, size);
+			}
+		}
+		return { scrollTop, scrollExtent, viewportExtent, atEffectiveBottom, loadingIndicatorPresent, rangeStart, rangeEnd, setSize };
+	`) as Promise<Omit<WebRobotBrowserScrollState, 'relevantNetworkIdle'>>;
+
 const interactionChanged = (
 	before: { bodyText: string; links: number; textLength: number; captures: number },
 	after: { bodyText: string; links: number; textLength: number; captures: number },
@@ -609,11 +832,15 @@ const captureResponse = async (
 	response: HTTPResponse,
 	rules: BrowserSource['capture'],
 	captures: WebRobotCapturedResponse[],
-	captureBudget: { count: number },
+	captureBudget: { count: number; reached: boolean },
 	maxResponseBytes: number,
 ): Promise<void> => {
 	for (const rule of rules) {
-		if (captureBudget.count >= MAX_CAPTURED_RESPONSES || !matchesPattern(response.url(), rule.urlPattern)) {
+		if (!matchesPattern(response.url(), rule.urlPattern)) {
+			continue;
+		}
+		if (captureBudget.count >= MAX_CAPTURED_RESPONSES) {
+			captureBudget.reached = true;
 			continue;
 		}
 		captureBudget.count += 1;
