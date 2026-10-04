@@ -1,78 +1,111 @@
+import { isLlmProvider, type LlmProvider, providerLabel, providerName } from '@nao/shared/types';
 import { experimental_transcribe as transcribe } from 'ai';
 
+import { PROVIDER_META } from '../agents/provider-meta';
 import {
 	createTranscribeModel,
 	getDefaultTranscribeModelId,
-	TRANSCRIBE_PROVIDERS,
-	type TranscribeProvider,
+	getTranscribeModels,
+	supportsTranscription,
 } from '../agents/transcribe.providers';
 import * as projectQueries from '../queries/project.queries';
-import * as llmConfigQueries from '../queries/project-llm-config.queries';
-import { getEnvApiKey } from '../utils/llm';
+import type { TranscribeModelDef } from '../types/llm';
+import { getProjectModelSources, isProviderDisabled, resolveProviderSettings } from '../utils/llm';
 
 export async function transcribeAudio(
 	projectId: string,
 	audio: string,
-	overrides?: { provider?: TranscribeProvider; modelId?: string },
+	overrides?: { provider?: LlmProvider; modelId?: string },
 ): Promise<string> {
 	const agentSettings = await projectQueries.getAgentSettings(projectId);
-	const savedProvider = agentSettings?.transcribe?.provider as TranscribeProvider | undefined;
-	const savedModelId = agentSettings?.transcribe?.modelId;
+	const transcribeSettings = agentSettings?.transcribe;
 
-	const provider: TranscribeProvider = overrides?.provider ?? savedProvider ?? 'openai';
-	const modelId = overrides?.modelId ?? savedModelId ?? getDefaultTranscribeModelId(provider);
-
-	const { apiKey, baseURL } = await resolveProviderSettings(projectId, provider);
-	if (!apiKey) {
-		throw new Error(`No API key configured for ${provider}. Add one in Settings > Models.`);
+	const candidate = overrides?.provider ?? transcribeSettings?.provider;
+	const provider = await resolveTranscribeProvider(projectId, candidate);
+	const modelId =
+		overrides?.modelId ??
+		(provider === candidate ? transcribeSettings?.modelId : undefined) ??
+		getDefaultTranscribeModelId(provider);
+	if (!modelId) {
+		throw new Error(`Select a transcription model for ${providerLabel(provider)} in Settings > Transcription.`);
 	}
 
-	const model = createTranscribeModel(provider, { apiKey, baseURL }, modelId);
+	const settings = await resolveProviderSettings(projectId, provider);
+	if (!settings) {
+		throw new Error(`No API key configured for ${providerLabel(provider)}. Add one in Settings > Models.`);
+	}
+
+	const model = createTranscribeModel(provider, settings, modelId);
 	const audioBuffer = Buffer.from(audio, 'base64');
 
 	const result = await transcribe({ model, audio: audioBuffer });
 	return result.text;
 }
 
-export async function listAvailableTranscribeModels(projectId: string) {
-	const available: Record<
-		string,
-		{
-			models: Array<{ id: string; name: string; default?: boolean; pricePerMinute?: number }>;
-			hasKey: boolean;
+/**
+ * Provider used for transcription when the saved one is missing or cannot transcribe.
+ * A usable saved/override provider always wins; otherwise the first source with
+ * credentials — same order the settings dropdown lists them — so the backend picks
+ * what the UI shows. 'openai' is the last resort for the sake of its error message.
+ */
+async function resolveTranscribeProvider(projectId: string, candidate: string | undefined): Promise<LlmProvider> {
+	if (candidate && isLlmProvider(candidate) && supportsTranscription(candidate)) {
+		if (isProviderDisabled(candidate)) {
+			throw new Error(`${providerLabel(candidate)} is disabled via DISABLED_PROVIDERS.`);
 		}
-	> = {};
+		return candidate;
+	}
 
-	for (const [provider, config] of Object.entries(TRANSCRIBE_PROVIDERS)) {
-		const llmProvider = provider as 'openai';
-		const dbConfig = await llmConfigQueries.getProjectLlmConfigByProvider(projectId, llmProvider);
-		const envKey = getEnvApiKey(llmProvider);
-		const hasKey = !!(dbConfig?.apiKey || envKey);
+	for (const [kind, meta] of Object.entries(PROVIDER_META)) {
+		if (!meta.transcription || isProviderDisabled(kind as LlmProvider)) {
+			continue;
+		}
+		if (await resolveProviderSettings(projectId, kind as LlmProvider)) {
+			return kind as LlmProvider;
+		}
+	}
 
+	const sources = await getProjectModelSources(projectId);
+	for (const { provider } of sources) {
+		if (!providerName(provider) || !supportsTranscription(provider)) {
+			continue;
+		}
+		if (await resolveProviderSettings(projectId, provider)) {
+			return provider;
+		}
+	}
+
+	return 'openai';
+}
+
+/**
+ * Transcription models of every configured provider whose kind speaks the audio API. Bare kinds
+ * are always listed (so the settings hint can name them); named instances only appear when
+ * configured, since they exist only through DB or nao_config.yaml declarations.
+ */
+export async function listAvailableTranscribeModels(projectId: string) {
+	const available: Record<string, { models: readonly TranscribeModelDef[]; hasKey: boolean }> = {};
+
+	for (const [kind, meta] of Object.entries(PROVIDER_META)) {
+		if (!meta.transcription || isProviderDisabled(kind as LlmProvider)) {
+			continue;
+		}
+		available[kind] = {
+			models: meta.transcription.models,
+			hasKey: (await resolveProviderSettings(projectId, kind as LlmProvider)) !== null,
+		};
+	}
+
+	const sources = await getProjectModelSources(projectId);
+	for (const { provider } of sources) {
+		if (!providerName(provider) || !supportsTranscription(provider)) {
+			continue;
+		}
 		available[provider] = {
-			models: config.models.map((m) => ({
-				id: m.id,
-				name: m.name,
-				...(m.default && { default: m.default }),
-				...(m.pricePerMinute != null && { pricePerMinute: m.pricePerMinute }),
-			})),
-			hasKey,
+			models: getTranscribeModels(provider),
+			hasKey: (await resolveProviderSettings(projectId, provider)) !== null,
 		};
 	}
 
 	return available;
-}
-
-async function resolveProviderSettings(
-	projectId: string,
-	provider: TranscribeProvider,
-): Promise<{ apiKey: string | undefined; baseURL: string | undefined }> {
-	const llmProvider = provider as 'openai';
-	const config = await llmConfigQueries.getProjectLlmConfigByProvider(projectId, llmProvider);
-
-	if (config) {
-		return { apiKey: config.apiKey, baseURL: config.baseUrl ?? undefined };
-	}
-
-	return { apiKey: getEnvApiKey(llmProvider), baseURL: undefined };
 }

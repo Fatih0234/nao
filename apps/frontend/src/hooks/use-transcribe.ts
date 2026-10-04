@@ -7,6 +7,7 @@ type TranscribeState = 'idle' | 'recording' | 'transcribing';
 export function useTranscribe({ onTranscribed }: { onTranscribed: (text: string) => void }) {
 	const [state, setState] = useState<TranscribeState>('idle');
 	const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+	const streamRef = useRef<MediaStream | null>(null);
 	const chunksRef = useRef<Blob[]>([]);
 	const analyserRef = useRef<AnalyserNode | null>(null);
 	const audioCtxRef = useRef<AudioContext | null>(null);
@@ -14,6 +15,21 @@ export function useTranscribe({ onTranscribed }: { onTranscribed: (text: string)
 	useEffect(() => {
 		onTranscribedRef.current = onTranscribed;
 	});
+
+	useEffect(() => {
+		return () => {
+			const recorder = mediaRecorderRef.current;
+			if (recorder && recorder.state !== 'inactive') {
+				try {
+					recorder.stop();
+				} catch {
+					// already stopped
+				}
+			}
+			streamRef.current?.getTracks().forEach((t) => t.stop());
+			audioCtxRef.current?.close();
+		};
+	}, []);
 
 	const stop = useCallback(() => {
 		if (mediaRecorderRef.current?.state === 'recording') {
@@ -42,7 +58,13 @@ export function useTranscribe({ onTranscribed }: { onTranscribed: (text: string)
 			return;
 		}
 
-		const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+		let stream: MediaStream;
+		try {
+			stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+		} catch {
+			return;
+		}
+		streamRef.current = stream;
 
 		const audioCtx = new AudioContext();
 		const source = audioCtx.createMediaStreamSource(stream);
@@ -79,7 +101,7 @@ export function useTranscribe({ onTranscribed }: { onTranscribed: (text: string)
 
 			try {
 				const base64 = await blobToBase64(blob);
-				const { text } = await trpcClient.transcribe.transcribe.mutate({ audio: base64 });
+				const text = await trpcClient.transcribe.transcribe.mutate({ audio: base64 });
 				if (text?.trim()) {
 					onTranscribedRef.current(text.trim());
 				}
