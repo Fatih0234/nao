@@ -12,11 +12,17 @@ import * as projectQueries from '../queries/project.queries';
 import type { ProviderSettings, TranscribeModelDef } from '../types/llm';
 import { getProjectModelSources, isProviderDisabled, resolveProviderSettings } from '../utils/llm';
 
+export interface TranscribeResult {
+	text: string;
+	language: string | undefined;
+	durationInSeconds: number | undefined;
+}
+
 export async function transcribeAudio(
 	projectId: string,
 	audio: string,
 	overrides?: { provider?: LlmProvider; modelId?: string },
-): Promise<string> {
+): Promise<TranscribeResult> {
 	const agentSettings = await projectQueries.getAgentSettings(projectId);
 	const transcribeSettings = agentSettings?.transcribe;
 
@@ -36,8 +42,27 @@ export async function transcribeAudio(
 	const model = createTranscribeModel(provider, settings, modelId);
 	const audioBuffer = Buffer.from(audio, 'base64');
 
-	const result = await transcribe({ model, audio: audioBuffer });
-	return result.text;
+	const result = await transcribe({
+		model,
+		audio: audioBuffer,
+		// An always-present openai key makes the SDK inject response_format
+		// (verbose_json for whisper models), which is what populates language
+		// and durationInSeconds on the result.
+		providerOptions: {
+			openai: {
+				...(transcribeSettings?.language && { language: transcribeSettings.language }),
+				...(transcribeSettings?.prompt && { prompt: transcribeSettings.prompt }),
+				...(transcribeSettings?.temperature != null && { temperature: transcribeSettings.temperature }),
+			},
+		},
+	});
+
+	// Some providers return 'en' or 'English' instead of OpenAI's lowercase 'english',
+	// which the SDK fails to map — surface the raw value in that case. The provider
+	// attaches the raw response as `body`, beyond what the metadata type declares.
+	const rawBody = (result.responses[0] as { body?: { language?: unknown } } | undefined)?.body;
+	const language = result.language ?? (typeof rawBody?.language === 'string' ? rawBody.language : undefined);
+	return { text: result.text, language, durationInSeconds: result.durationInSeconds };
 }
 
 /**

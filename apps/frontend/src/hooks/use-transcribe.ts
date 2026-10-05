@@ -112,7 +112,7 @@ export function useTranscribe({ onTranscribed }: { onTranscribed: (text: string)
 
 			try {
 				const base64 = await blobToBase64(blob);
-				const text = await trpcClient.transcribe.transcribe.mutate({ audio: base64 });
+				const { text } = await trpcClient.transcribe.transcribe.mutate({ audio: base64 });
 				if (text?.trim()) {
 					onTranscribedRef.current(text.trim());
 				}

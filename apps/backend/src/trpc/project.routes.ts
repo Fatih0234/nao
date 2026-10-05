@@ -950,6 +950,9 @@ export const projectRoutes = {
 							.refine(supportsTranscription, { message: 'Provider does not support transcription' })
 							.optional(),
 						modelId: z.string().optional(),
+						language: z.string().optional(),
+						prompt: z.string().max(2000).optional(),
+						temperature: z.number().min(0).max(1).optional(),
 					})
 					.optional(),
 				sql: z

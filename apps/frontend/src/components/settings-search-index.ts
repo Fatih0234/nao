@@ -345,7 +345,7 @@ export const settingsSearchIndex: SettingsSearchEntry[] = [
 		search: { tab: 'models' },
 		title: 'Transcription',
 		description: 'Configure speech-to-text transcription provider and model.',
-		keywords: ['voice', 'speech', 'microphone', 'whisper', 'stt'],
+		keywords: ['voice', 'speech', 'microphone', 'whisper', 'stt', 'language', 'prompt', 'temperature'],
 	},
 
 	// ── Project > Agent ──────────────────────────────────────

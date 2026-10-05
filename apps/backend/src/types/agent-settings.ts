@@ -13,6 +13,9 @@ export interface AgentSettings {
 		enabled?: boolean;
 		provider?: string;
 		modelId?: string;
+		language?: string;
+		prompt?: string;
+		temperature?: number;
 	};
 	sql?: {
 		dangerouslyWritePermEnabled?: boolean;

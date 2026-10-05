@@ -52,15 +52,17 @@ describe('project.updateAgentSettings', () => {
 
 	it('merges a partial transcribe update into the stored settings', async () => {
 		testState.agentSettings = {
-			transcribe: { enabled: true, provider: 'groq' },
+			transcribe: { enabled: true, provider: 'groq', modelId: 'whisper-large-v3', prompt: 'kept' },
 		};
 
-		await caller().updateAgentSettings({ transcribe: { modelId: 'whisper-large-v3' } });
+		await caller().updateAgentSettings({ transcribe: { language: 'tr' } });
 
 		expect(testState.updatedSettings?.transcribe).toEqual({
 			enabled: true,
 			provider: 'groq',
 			modelId: 'whisper-large-v3',
+			prompt: 'kept',
+			language: 'tr',
 		});
 	});
 
@@ -70,14 +72,19 @@ describe('project.updateAgentSettings', () => {
 			transcribe: { enabled: true, provider: 'groq' },
 		};
 
-		await caller().updateAgentSettings({ transcribe: { modelId: 'whisper-large-v3-turbo' } });
+		await caller().updateAgentSettings({ transcribe: { temperature: 0.4 } });
 
 		expect(testState.updatedSettings?.subagent).toEqual({ model: { provider: 'openai', modelId: 'gpt-4o' } });
 		expect(testState.updatedSettings?.transcribe).toEqual({
 			enabled: true,
 			provider: 'groq',
-			modelId: 'whisper-large-v3-turbo',
+			temperature: 0.4,
 		});
+	});
+
+	it('rejects a temperature above 1', async () => {
+		await expect(caller().updateAgentSettings({ transcribe: { temperature: 1.5 } })).rejects.toThrow();
+		expect(testState.updatedSettings).toBeNull();
 	});
 
 	it('rejects a provider that cannot transcribe', async () => {
@@ -94,6 +101,11 @@ describe('project.updateAgentSettings', () => {
 			provider: 'groq',
 			modelId: 'whisper-large-v3-turbo',
 		});
+	});
+
+	it('rejects a prompt over 2000 characters', async () => {
+		await expect(caller().updateAgentSettings({ transcribe: { prompt: 'x'.repeat(2001) } })).rejects.toThrow();
+		expect(testState.updatedSettings).toBeNull();
 	});
 });
 

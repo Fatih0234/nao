@@ -128,16 +128,47 @@ describe('listAvailableTranscribeModels', () => {
 });
 
 describe('transcribeAudio', () => {
-	it('uses the saved provider and model id', async () => {
+	it('forwards saved language, prompt and temperature to the provider', async () => {
 		process.env.GROQ_API_KEY = 'gsk-test';
 		testState.agentSettings = {
-			transcribe: { provider: 'groq', modelId: 'whisper-large-v3-turbo' },
+			transcribe: {
+				provider: 'groq',
+				modelId: 'whisper-large-v3-turbo',
+				language: 'tr',
+				prompt: 'jaffle_shop, stripe_invoice_id',
+				temperature: 0.3,
+			},
 		};
 
 		const result = await transcribeAudio('project-id', 'aGk=');
 
-		expect(result).toBe('hello');
+		expect(result).toEqual({ text: 'hello', language: 'tr', durationInSeconds: 5 });
 		expect(testState.transcribeCalls.at(-1)?.model?.modelId).toBe('whisper-large-v3-turbo');
+		expect(testState.transcribeCalls.at(-1)?.providerOptions?.openai).toEqual({
+			language: 'tr',
+			prompt: 'jaffle_shop, stripe_invoice_id',
+			temperature: 0.3,
+		});
+	});
+
+	it('forwards an explicit temperature of 0', async () => {
+		process.env.GROQ_API_KEY = 'gsk-test';
+		testState.agentSettings = {
+			transcribe: { provider: 'groq', temperature: 0, language: '' },
+		};
+
+		await transcribeAudio('project-id', 'aGk=');
+
+		expect(testState.transcribeCalls.at(-1)?.providerOptions?.openai).toEqual({ temperature: 0 });
+	});
+
+	it('sends no provider options when none are configured', async () => {
+		process.env.GROQ_API_KEY = 'gsk-test';
+		testState.agentSettings = { transcribe: { provider: 'groq' } };
+
+		await transcribeAudio('project-id', 'aGk=');
+
+		expect(testState.transcribeCalls.at(-1)?.providerOptions?.openai).toEqual({});
 	});
 
 	it('falls back to the first keyed provider and drops a stale model id', async () => {
@@ -175,6 +206,21 @@ describe('transcribeAudio', () => {
 		testState.agentSettings = { transcribe: { provider: 'openaiCompatible' } };
 
 		await expect(transcribeAudio('project-id', 'aGk=')).rejects.toThrow('Select a transcription model');
+	});
+
+	it('surfaces the raw response language when the SDK does not map it', async () => {
+		process.env.GROQ_API_KEY = 'gsk-test';
+		testState.agentSettings = { transcribe: { provider: 'groq' } };
+		testState.transcribeResult = {
+			text: 'hi',
+			segments: [],
+			language: undefined,
+			responses: [{ body: { language: 'English' } }],
+		};
+
+		const result = await transcribeAudio('project-id', 'aGk=');
+
+		expect(result.language).toBe('English');
 	});
 });
 
