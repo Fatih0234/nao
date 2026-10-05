@@ -110,7 +110,10 @@ describe('getModelCapabilities', () => {
 			thinking: 'adaptive',
 			effortOptions: ['off', 'low', 'medium', 'high'],
 		});
-		expect(getModelCapabilities('groq', 'openai/gpt-oss-future')).toMatchObject({ thinking: 'adaptive' });
+		expect(getModelCapabilities('groq', 'openai/gpt-oss-future')).toMatchObject({
+			thinking: 'adaptive',
+			effortOptions: ['off', 'low', 'medium', 'high'],
+		});
 		expect(getModelCapabilities('groq', 'llama-custom')).toMatchObject({ thinking: 'none', sampling: true });
 	});
 

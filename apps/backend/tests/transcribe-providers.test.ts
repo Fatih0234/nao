@@ -52,6 +52,12 @@ describe('createTranscribeModel', () => {
 		}
 	});
 
+	it('uses the provider default endpoint when no base URL is set', () => {
+		const model = createTranscribeModel('openai', { apiKey: 'k' }, 'whisper-1');
+		expect(model.provider).toBe('openai.transcription');
+		expect(model.modelId).toBe('whisper-1');
+	});
+
 	it('accepts keyless endpoints via a placeholder key', () => {
 		const model = createTranscribeModel(
 			'openaiCompatible/local',

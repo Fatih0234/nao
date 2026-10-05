@@ -11,6 +11,7 @@ export function useTranscribe({ onTranscribed }: { onTranscribed: (text: string)
 	const chunksRef = useRef<Blob[]>([]);
 	const analyserRef = useRef<AnalyserNode | null>(null);
 	const audioCtxRef = useRef<AudioContext | null>(null);
+	const disposedRef = useRef(false);
 	const onTranscribedRef = useRef(onTranscribed);
 	useEffect(() => {
 		onTranscribedRef.current = onTranscribed;
@@ -18,12 +19,18 @@ export function useTranscribe({ onTranscribed }: { onTranscribed: (text: string)
 
 	useEffect(() => {
 		return () => {
+			disposedRef.current = true;
 			const recorder = mediaRecorderRef.current;
-			if (recorder && recorder.state !== 'inactive') {
-				try {
-					recorder.stop();
-				} catch {
-					// already stopped
+			if (recorder) {
+				// Detach handlers so the stop below does not fire an upload after unmount.
+				recorder.onstop = null;
+				recorder.ondataavailable = null;
+				if (recorder.state !== 'inactive') {
+					try {
+						recorder.stop();
+					} catch {
+						// already stopped
+					}
 				}
 			}
 			streamRef.current?.getTracks().forEach((t) => t.stop());
@@ -62,6 +69,10 @@ export function useTranscribe({ onTranscribed }: { onTranscribed: (text: string)
 		try {
 			stream = await navigator.mediaDevices.getUserMedia({ audio: true });
 		} catch {
+			return;
+		}
+		if (disposedRef.current) {
+			stream.getTracks().forEach((t) => t.stop());
 			return;
 		}
 		streamRef.current = stream;

@@ -362,6 +362,7 @@ class ProviderConfig(BaseModel):
             questionary.Choice("Qwen (Alibaba Cloud Model Studio)", value="qwen"),
             questionary.Choice("MiniMax", value="minimax"),
             questionary.Choice("Moonshot (Kimi)", value="moonshot"),
+            questionary.Choice("Groq", value="groq"),
             questionary.Choice("Other OpenAI-compatible endpoint (vLLM, LiteLLM, ...)", value="openaiCompatible"),
         ]
         provider_choices = [

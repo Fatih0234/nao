@@ -280,6 +280,10 @@ export function disableModelReasoning(provider: LlmProvider, modelResult: Provid
 		case 'qwen':
 			options.enable_thinking = false;
 			break;
+		case 'groq':
+			// Groq accepts only low/medium/high, so 'low' is the closest to disabled.
+			options.reasoningEffort = 'low';
+			break;
 	}
 
 	return {

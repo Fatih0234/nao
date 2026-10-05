@@ -1,7 +1,7 @@
 import { isLlmProvider, type LlmProvider, providerLabel, providerName } from '@nao/shared/types';
 import { experimental_transcribe as transcribe } from 'ai';
 
-import { PROVIDER_META } from '../agents/provider-meta';
+import { getProviderMeta, PROVIDER_META } from '../agents/provider-meta';
 import {
 	createTranscribeModel,
 	getDefaultTranscribeModelId,
@@ -9,7 +9,7 @@ import {
 	supportsTranscription,
 } from '../agents/transcribe.providers';
 import * as projectQueries from '../queries/project.queries';
-import type { TranscribeModelDef } from '../types/llm';
+import type { ProviderSettings, TranscribeModelDef } from '../types/llm';
 import { getProjectModelSources, isProviderDisabled, resolveProviderSettings } from '../utils/llm';
 
 export async function transcribeAudio(
@@ -21,7 +21,7 @@ export async function transcribeAudio(
 	const transcribeSettings = agentSettings?.transcribe;
 
 	const candidate = overrides?.provider ?? transcribeSettings?.provider;
-	const provider = await resolveTranscribeProvider(projectId, candidate);
+	const { provider, settings } = await resolveTranscribeProvider(projectId, candidate);
 	const modelId =
 		overrides?.modelId ??
 		(provider === candidate ? transcribeSettings?.modelId : undefined) ??
@@ -29,8 +29,6 @@ export async function transcribeAudio(
 	if (!modelId) {
 		throw new Error(`Select a transcription model for ${providerLabel(provider)} in Settings > Transcription.`);
 	}
-
-	const settings = await resolveProviderSettings(projectId, provider);
 	if (!settings) {
 		throw new Error(`No API key configured for ${providerLabel(provider)}. Add one in Settings > Models.`);
 	}
@@ -47,21 +45,30 @@ export async function transcribeAudio(
  * A usable saved/override provider always wins; otherwise the first source with
  * credentials — same order the settings dropdown lists them — so the backend picks
  * what the UI shows. 'openai' is the last resort for the sake of its error message.
+ * Returns the settings already resolved during the scan so the caller does not
+ * look them up a second time.
  */
-async function resolveTranscribeProvider(projectId: string, candidate: string | undefined): Promise<LlmProvider> {
+async function resolveTranscribeProvider(
+	projectId: string,
+	candidate: string | undefined,
+): Promise<{ provider: LlmProvider; settings: ProviderSettings | null }> {
 	if (candidate && isLlmProvider(candidate) && supportsTranscription(candidate)) {
 		if (isProviderDisabled(candidate)) {
 			throw new Error(`${providerLabel(candidate)} is disabled via DISABLED_PROVIDERS.`);
 		}
-		return candidate;
+		const settings = await resolveUsableSettings(projectId, candidate);
+		if (settings) {
+			return { provider: candidate, settings };
+		}
 	}
 
 	for (const [kind, meta] of Object.entries(PROVIDER_META)) {
 		if (!meta.transcription || isProviderDisabled(kind as LlmProvider)) {
 			continue;
 		}
-		if (await resolveProviderSettings(projectId, kind as LlmProvider)) {
-			return kind as LlmProvider;
+		const settings = await resolveUsableSettings(projectId, kind as LlmProvider);
+		if (settings) {
+			return { provider: kind as LlmProvider, settings };
 		}
 	}
 
@@ -70,12 +77,29 @@ async function resolveTranscribeProvider(projectId: string, candidate: string | 
 		if (!providerName(provider) || !supportsTranscription(provider)) {
 			continue;
 		}
-		if (await resolveProviderSettings(projectId, provider)) {
-			return provider;
+		const settings = await resolveUsableSettings(projectId, provider);
+		if (settings) {
+			return { provider, settings };
 		}
 	}
 
-	return 'openai';
+	return { provider: 'openai', settings: null };
+}
+
+/**
+ * Settings are usable when a key exists, or when the provider does not require one
+ * (a local OpenAI-compatible endpoint). An empty key on a required provider means a
+ * saved config lost its credential, which should not count as configured.
+ */
+async function resolveUsableSettings(projectId: string, provider: LlmProvider): Promise<ProviderSettings | null> {
+	const settings = await resolveProviderSettings(projectId, provider);
+	if (!settings) {
+		return null;
+	}
+	if (getProviderMeta(provider).auth.apiKey === 'required' && !settings.apiKey) {
+		return null;
+	}
+	return settings;
 }
 
 /**
@@ -92,7 +116,7 @@ export async function listAvailableTranscribeModels(projectId: string) {
 		}
 		available[kind] = {
 			models: meta.transcription.models,
-			hasKey: (await resolveProviderSettings(projectId, kind as LlmProvider)) !== null,
+			hasKey: (await resolveUsableSettings(projectId, kind as LlmProvider)) !== null,
 		};
 	}
 
@@ -103,7 +127,7 @@ export async function listAvailableTranscribeModels(projectId: string) {
 		}
 		available[provider] = {
 			models: getTranscribeModels(provider),
-			hasKey: (await resolveProviderSettings(projectId, provider)) !== null,
+			hasKey: (await resolveUsableSettings(projectId, provider)) !== null,
 		};
 	}
 

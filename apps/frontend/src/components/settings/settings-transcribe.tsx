@@ -46,14 +46,18 @@ export function SettingsTranscribe({ isAdmin }: SettingsTranscribeProps) {
 	const savedModelId = agentSettings.data?.transcribe?.modelId;
 	const currentModelId = savedModelId ?? providerModels.find((m) => m.default)?.id ?? '';
 	const [customMode, setCustomMode] = useState(false);
+	const [forceCatalog, setForceCatalog] = useState(false);
 	const [modelDraft, setModelDraft] = useState('');
 	const isCustomModel =
-		customMode ||
-		providerModels.length === 0 ||
-		(savedModelId != null && !providerModels.some((m) => m.id === savedModelId));
+		!forceCatalog &&
+		(customMode ||
+			providerModels.length === 0 ||
+			(savedModelId != null && !providerModels.some((m) => m.id === savedModelId)));
+	const testModelId = isCustomModel ? modelDraft.trim() : currentModelId;
 
 	useEffect(() => {
 		setCustomMode(false);
+		setForceCatalog(false);
 		setModelDraft(savedModelId ?? '');
 	}, [savedModelId, currentProvider]);
 
@@ -86,7 +90,7 @@ export function SettingsTranscribe({ isAdmin }: SettingsTranscribeProps) {
 		});
 	};
 
-	const { testState, testResult, countdown, startTest } = useTranscribeTest(currentProvider, currentModelId);
+	const { testState, testResult, countdown, startTest } = useTranscribeTest(currentProvider, testModelId);
 
 	const isMutating = updateAgentSettings.isPending;
 	const isTesting = testState !== 'idle';
@@ -161,7 +165,14 @@ export function SettingsTranscribe({ isAdmin }: SettingsTranscribeProps) {
 											Save
 										</Button>
 										{providerModels.length > 0 && (
-											<Button variant='ghost' size='sm' onClick={() => setCustomMode(false)}>
+											<Button
+												variant='ghost'
+												size='sm'
+												onClick={() => {
+													setForceCatalog(true);
+													setCustomMode(false);
+												}}
+											>
 												List
 											</Button>
 										)}
@@ -209,7 +220,7 @@ export function SettingsTranscribe({ isAdmin }: SettingsTranscribeProps) {
 										variant='outline'
 										size='sm'
 										onClick={startTest}
-										disabled={isTesting || !currentProvider || !currentModelId}
+										disabled={isTesting || !currentProvider || !testModelId}
 									>
 										{testState === 'recording' ? (
 											<>
@@ -289,16 +300,23 @@ function useTranscribeTest(provider: string, modelId: string) {
 	const mediaRecorderRef = useRef<MediaRecorder | null>(null);
 	const streamRef = useRef<MediaStream | null>(null);
 	const startingRef = useRef(false);
+	const disposedRef = useRef(false);
 	const chunksRef = useRef<Blob[]>([]);
 
 	useEffect(() => {
 		return () => {
+			disposedRef.current = true;
 			const recorder = mediaRecorderRef.current;
-			if (recorder && recorder.state !== 'inactive') {
-				try {
-					recorder.stop();
-				} catch {
-					// already stopped
+			if (recorder) {
+				// Detach handlers so the stop below does not fire an upload after unmount.
+				recorder.onstop = null;
+				recorder.ondataavailable = null;
+				if (recorder.state !== 'inactive') {
+					try {
+						recorder.stop();
+					} catch {
+						// already stopped
+					}
 				}
 			}
 			streamRef.current?.getTracks().forEach((t) => t.stop());
@@ -342,6 +360,10 @@ function useTranscribeTest(provider: string, modelId: string) {
 			return;
 		}
 		startingRef.current = false;
+		if (disposedRef.current) {
+			stream.getTracks().forEach((t) => t.stop());
+			return;
+		}
 
 		setTestState('recording');
 		streamRef.current = stream;

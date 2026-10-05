@@ -270,7 +270,6 @@ export const settingsSearchIndex: SettingsSearchEntry[] = [
 			'moonshot',
 			'kimi',
 			'groq',
-			'whisper',
 			'requesty',
 			'llm',
 			'model',
