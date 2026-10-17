@@ -142,10 +142,9 @@ function ChatInputBase({
 	const effectivePlaceholder = isRunning && allowQueueing ? 'Add a follow-up...' : placeholder;
 
 	const agentSettings = useQuery(trpc.project.getAgentSettings.queryOptions());
-	const transcribeModels = useQuery(trpc.project.getKnownTranscribeModels.queryOptions());
+	const transcribeTarget = useQuery(trpc.transcribe.getTarget.queryOptions());
 	const isTranscribeEnabled = agentSettings.data?.transcribe?.enabled ?? false;
-	const hasTranscribeProvider = Object.values(transcribeModels.data ?? {}).some((p) => p.hasKey);
-	const isTranscribeReady = isTranscribeEnabled && hasTranscribeProvider;
+	const isTranscribeReady = isTranscribeReadyForChat(isTranscribeEnabled, transcribeTarget.data);
 
 	const budgetStatus = useQuery({
 		...trpc.budget.checkBudgetStatus.queryOptions({ provider: selectedModel?.provider ?? 'openai' }),
@@ -156,6 +155,7 @@ function ChatInputBase({
 
 	const [micWarning, setMicWarning] = useState(false);
 	const micWarningTimer = useRef(0);
+	const transcribeErrorTimer = useRef(0);
 	const dropZoneRef = useRef<HTMLDivElement>(null);
 	const [isDragging, setIsDragging] = useState(false);
 
@@ -339,7 +339,18 @@ function ChatInputBase({
 		isRecording,
 		isTranscribing,
 		analyserRef,
+		error: transcribeError,
+		clearError: clearTranscribeError,
 	} = useTranscribe({ onTranscribed: submitMessage });
+
+	useEffect(() => {
+		if (!transcribeError) {
+			return;
+		}
+		window.clearTimeout(transcribeErrorTimer.current);
+		transcribeErrorTimer.current = window.setTimeout(() => clearTranscribeError(), 5000);
+		return () => window.clearTimeout(transcribeErrorTimer.current);
+	}, [transcribeError, clearTranscribeError]);
 
 	useEffect(() => {
 		if (typeof initialText !== 'string') {
@@ -398,6 +409,22 @@ function ChatInputBase({
 			<ChatInputMessageQueue onEditMessage={handleEditQueuedMessage} onSubmitNow={submitQueuedMessageWithGuard} />
 			<SelectionCitationBanner />
 			<BudgetBanner />
+			{transcribeError && (
+				<div
+					role='alert'
+					className='mb-2 flex items-start gap-2.5 rounded-2xl border border-destructive/30 bg-destructive/10 px-3 py-2.5 text-sm text-destructive animate-in fade-in slide-in-from-bottom-2 duration-200'
+				>
+					<p className='flex-1 min-w-0'>{transcribeError}</p>
+					<button
+						type='button'
+						onClick={clearTranscribeError}
+						aria-label='Dismiss transcription error'
+						className='shrink-0 text-destructive hover:text-destructive/80 cursor-pointer'
+					>
+						&times;
+					</button>
+				</div>
+			)}
 			{allowQueueing && !isAdminMode && (
 				<ChatInputSuggestions
 					storyCreationEnabled={storyCreationEnabled}
@@ -475,7 +502,12 @@ function ChatInputBase({
 								onClick={isTranscribeReady ? toggleRecording : showMicWarning}
 								disabled={isRunning && !allowQueueing}
 							/>
-							{micWarning && <MicWarningBanner onDismiss={() => setMicWarning(false)} />}
+							{micWarning && (
+								<MicWarningBanner
+									onDismiss={() => setMicWarning(false)}
+									message={getMicWarningMessage(isTranscribeEnabled, transcribeTarget.data)}
+								/>
+							)}
 
 							{allowQueueing && isRunning ? (
 								<ChatButton
@@ -772,7 +804,20 @@ function RecordingTimer() {
 	);
 }
 
-function MicWarningBanner({ onDismiss }: { onDismiss: () => void }) {
+export type TranscribeTargetState = { provider: string | null; error: string | null } | undefined;
+
+export function isTranscribeReadyForChat(isEnabled: boolean, target: TranscribeTargetState): boolean {
+	return isEnabled && target?.provider != null && target?.error == null;
+}
+
+export function getMicWarningMessage(isEnabled: boolean, target: TranscribeTargetState): string | undefined {
+	if (!isEnabled) {
+		return undefined;
+	}
+	return target?.error ?? undefined;
+}
+
+export function MicWarningBanner({ onDismiss, message }: { onDismiss: () => void; message?: string }) {
 	return (
 		<div className='absolute bottom-full right-0 mb-2 w-64 rounded-md border bg-popover p-3 text-popover-foreground shadow-md animate-in fade-in slide-in-from-bottom-2 duration-200'>
 			<button
@@ -782,16 +827,28 @@ function MicWarningBanner({ onDismiss }: { onDismiss: () => void }) {
 			>
 				&times;
 			</button>
-			<p className='text-sm'>
-				Voice input is not configured.{' '}
-				<Link
-					to='/settings/project/models'
-					className='font-medium text-primary underline underline-offset-2 hover:text-primary/80'
-				>
-					Go to Settings &rarr; Models
-				</Link>{' '}
-				to enable transcription and set up a provider. Ask your admin.
-			</p>
+			{message ? (
+				<p className='text-sm'>
+					{message} <TranscriptionSettingsLink />
+				</p>
+			) : (
+				<p className='text-sm'>
+					Voice input is not configured. <TranscriptionSettingsLink /> to enable transcription and set up a
+					provider.
+				</p>
+			)}
 		</div>
+	);
+}
+
+function TranscriptionSettingsLink() {
+	return (
+		<Link
+			to='/settings/project/agent'
+			search={{ tab: 'models' }}
+			className='font-medium text-primary underline underline-offset-2 hover:text-primary/80'
+		>
+			Go to Settings &gt; Transcription
+		</Link>
 	);
 }

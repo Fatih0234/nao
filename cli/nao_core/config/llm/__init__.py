@@ -25,6 +25,7 @@ class LLMProvider(str, Enum):
     MINIMAX = "minimax"
     MOONSHOT = "moonshot"
     META = "meta"
+    GROQ = "groq"
     OPENAI_COMPATIBLE = "openaiCompatible"
 
 
@@ -107,6 +108,12 @@ PROVIDER_AUTH: dict[LLMProvider, ProviderAuthConfig] = {
         base_url_env_var="META_BASE_URL",
         default_base_url="https://api.meta.ai/v1",
     ),
+    LLMProvider.GROQ: ProviderAuthConfig(
+        env_var="GROQ_API_KEY",
+        api_key="required",
+        base_url_env_var="GROQ_BASE_URL",
+        default_base_url="https://api.groq.com/openai/v1",
+    ),
     LLMProvider.OPENAI_COMPATIBLE: ProviderAuthConfig(
         env_var="OPENAI_COMPATIBLE_API_KEY",
         api_key="optional",
@@ -126,6 +133,7 @@ OPENAI_COMPATIBLE_PROVIDERS: frozenset[LLMProvider] = frozenset(
         LLMProvider.MINIMAX,
         LLMProvider.MOONSHOT,
         LLMProvider.META,
+        LLMProvider.GROQ,
         LLMProvider.OPENAI_COMPATIBLE,
     }
 )
@@ -148,6 +156,7 @@ DEFAULT_ANNOTATION_MODELS: dict[LLMProvider, str] = {
     LLMProvider.MINIMAX: "MiniMax-M2.7",
     LLMProvider.MOONSHOT: "kimi-k2.5",
     LLMProvider.META: "muse-spark-1.3",
+    LLMProvider.GROQ: "openai/gpt-oss-20b",
 }
 
 """Spellings accepted in config on top of the provider names nao uses internally."""
@@ -363,6 +372,7 @@ class ProviderConfig(BaseModel):
             questionary.Choice("MiniMax", value="minimax"),
             questionary.Choice("Moonshot (Kimi)", value="moonshot"),
             questionary.Choice("Meta (Muse Spark, Muse Wonder)", value="meta"),
+            questionary.Choice("Groq", value="groq"),
             questionary.Choice("Other OpenAI-compatible endpoint (vLLM, LiteLLM, ...)", value="openaiCompatible"),
         ]
         provider_choices = [

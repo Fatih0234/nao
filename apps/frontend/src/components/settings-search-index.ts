@@ -366,6 +366,7 @@ export const settingsSearchIndex: SettingsSearchEntry[] = [
 			'kimi',
 			'meta',
 			'muse',
+			'groq',
 			'requesty',
 			'llm',
 			'model',

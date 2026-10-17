@@ -554,6 +554,19 @@ describe('Qwen, MiniMax and Moonshot (OpenAI-compatible endpoints)', () => {
 	});
 });
 
+describe('Groq', () => {
+	it('sends reasoning effort only to reasoning models when disabling', () => {
+		const llama = createProviderModel('groq', SETTINGS, 'llama-3.3-70b-versatile', { reasoningEffort: 'high' });
+		const llamaOptions = disableModelReasoning('groq', llama).providerOptions.groq as Record<string, unknown>;
+
+		const oss = createProviderModel('groq', SETTINGS, 'openai/gpt-oss-20b', { reasoningEffort: 'high' });
+		const ossOptions = disableModelReasoning('groq', oss).providerOptions.groq as Record<string, unknown>;
+
+		expect(llamaOptions).not.toHaveProperty('reasoningEffort');
+		expect(ossOptions.reasoningEffort).toBe('low');
+	});
+});
+
 describe('generic OpenAI-compatible endpoints', () => {
 	it('sends the effort under the key the SDK turns into reasoning_effort', () => {
 		const { options } = resolve('openaiCompatible', 'my-model', { reasoningEffort: 'high' });

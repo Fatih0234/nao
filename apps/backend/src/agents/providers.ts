@@ -203,6 +203,10 @@ export const LLM_PROVIDERS: LlmProvidersType = {
 		...PROVIDER_META.requesty,
 		create: (settings, modelId) => createCompatibleModel('requesty', settings, modelId),
 	},
+	groq: {
+		...PROVIDER_META.groq,
+		create: (settings, modelId) => createCompatibleModel('groq', settings, modelId),
+	},
 	openaiCompatible: {
 		...PROVIDER_META.openaiCompatible,
 		create: (settings, modelId) => createCompatibleModel('openaiCompatible', settings, modelId),
@@ -288,6 +292,11 @@ export function disableModelReasoning(provider: LlmProvider, modelResult: Provid
 			break;
 		case 'qwen':
 			options.enable_thinking = false;
+			break;
+		case 'groq':
+			if (getModelCapabilities(provider, modelResult.model.modelId)?.thinking !== 'none') {
+				options.reasoningEffort = 'low';
+			}
 			break;
 	}
 
@@ -509,6 +518,7 @@ function resolveThinking(
 			return resolveQwenThinking(capabilities, settings);
 		case 'requesty':
 		case 'openaiCompatible':
+		case 'groq':
 			// The SDK turns this into the `reasoning_effort` field of the OpenAI chat API.
 			return resolveEffortThinking(effort, (e) => ({ reasoningEffort: EFFORT_TO_OPENAI[e] }));
 		default:

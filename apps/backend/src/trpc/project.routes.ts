@@ -11,6 +11,7 @@ import { TRPCError } from '@trpc/server';
 import { z } from 'zod/v4';
 
 import { getProviderAuth, KNOWN_MODELS } from '../agents/providers';
+import { supportsTranscription } from '../agents/transcribe.providers';
 import { getDatabaseObjects } from '../agents/user-rules';
 import { env } from '../env';
 import * as chatQueries from '../queries/chat.queries';
@@ -122,6 +123,21 @@ async function validateBoundarySource(url: string): Promise<number> {
 			message: `Could not load boundaries from URL: ${error instanceof Error ? error.message : String(error)}`,
 		});
 	}
+}
+
+type TranscribeSettings = NonNullable<AgentSettings['transcribe']>;
+
+/** A saved model id belongs to its provider, so switching provider without a model id drops it. */
+function mergeTranscribeSettings(
+	existing: TranscribeSettings | undefined,
+	input: TranscribeSettings | undefined,
+): TranscribeSettings {
+	const merged = { ...existing, ...input };
+	const providerChanged = input?.provider !== undefined && input.provider !== existing?.provider;
+	if (providerChanged && input.modelId === undefined) {
+		delete merged.modelId;
+	}
+	return merged;
 }
 
 export const projectRoutes = {
@@ -926,7 +942,9 @@ export const projectRoutes = {
 				transcribe: z
 					.object({
 						enabled: z.boolean().optional(),
-						provider: z.string().optional(),
+						provider: llmProviderSchema
+							.refine(supportsTranscription, { message: 'Provider does not support transcription' })
+							.optional(),
 						modelId: z.string().optional(),
 					})
 					.optional(),
@@ -971,7 +989,7 @@ export const projectRoutes = {
 				memoryEnabled: input.memoryEnabled ?? existing.memoryEnabled,
 				mapEnabled: input.mapEnabled ?? existing.mapEnabled,
 				experimental: { ...existing.experimental, ...input.experimental },
-				transcribe: { ...existing.transcribe, ...input.transcribe },
+				transcribe: mergeTranscribeSettings(existing.transcribe, input.transcribe),
 				sql: { ...existing.sql, ...input.sql },
 				pythonExecution: { ...existing.pythonExecution, ...input.pythonExecution },
 				webSearch: { ...existing.webSearch, ...input.webSearch },

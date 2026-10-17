@@ -6,14 +6,38 @@ type TranscribeState = 'idle' | 'recording' | 'transcribing';
 
 export function useTranscribe({ onTranscribed }: { onTranscribed: (text: string) => void }) {
 	const [state, setState] = useState<TranscribeState>('idle');
+	const [error, setError] = useState<string | null>(null);
 	const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+	const streamRef = useRef<MediaStream | null>(null);
 	const chunksRef = useRef<Blob[]>([]);
 	const analyserRef = useRef<AnalyserNode | null>(null);
 	const audioCtxRef = useRef<AudioContext | null>(null);
+	const disposedRef = useRef(false);
 	const onTranscribedRef = useRef(onTranscribed);
 	useEffect(() => {
 		onTranscribedRef.current = onTranscribed;
 	});
+
+	useEffect(() => {
+		return () => {
+			disposedRef.current = true;
+			const recorder = mediaRecorderRef.current;
+			if (recorder) {
+				// Detach handlers so the stop below does not fire an upload after unmount.
+				recorder.onstop = null;
+				recorder.ondataavailable = null;
+				if (recorder.state !== 'inactive') {
+					try {
+						recorder.stop();
+					} catch {
+						// already stopped
+					}
+				}
+			}
+			streamRef.current?.getTracks().forEach((t) => t.stop());
+			audioCtxRef.current?.close();
+		};
+	}, []);
 
 	const stop = useCallback(() => {
 		if (mediaRecorderRef.current?.state === 'recording') {
@@ -42,7 +66,20 @@ export function useTranscribe({ onTranscribed }: { onTranscribed: (text: string)
 			return;
 		}
 
-		const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+		setError(null);
+		let stream: MediaStream;
+		try {
+			stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+		} catch (err) {
+			const message = err instanceof Error && err.message ? err.message : 'Microphone access denied';
+			setError(message);
+			return;
+		}
+		if (disposedRef.current) {
+			stream.getTracks().forEach((t) => t.stop());
+			return;
+		}
+		streamRef.current = stream;
 
 		const audioCtx = new AudioContext();
 		const source = audioCtx.createMediaStreamSource(stream);
@@ -79,12 +116,14 @@ export function useTranscribe({ onTranscribed }: { onTranscribed: (text: string)
 
 			try {
 				const base64 = await blobToBase64(blob);
-				const { text } = await trpcClient.transcribe.transcribe.mutate({ audio: base64 });
+				const text = await trpcClient.transcribe.transcribe.mutate({ audio: base64 });
 				if (text?.trim()) {
 					onTranscribedRef.current(text.trim());
 				}
 			} catch (err) {
+				const message = err instanceof Error ? err.message : 'Transcription failed';
 				console.error('Transcription error:', err);
+				setError(message);
 			} finally {
 				setState('idle');
 			}
@@ -93,6 +132,10 @@ export function useTranscribe({ onTranscribed }: { onTranscribed: (text: string)
 		mediaRecorder.start();
 		setState('recording');
 	}, [state]);
+
+	const clearError = useCallback(() => {
+		setError(null);
+	}, []);
 
 	const toggle = useCallback(() => {
 		if (state === 'recording') {
@@ -108,6 +151,8 @@ export function useTranscribe({ onTranscribed }: { onTranscribed: (text: string)
 		isRecording: state === 'recording',
 		isTranscribing: state === 'transcribing',
 		analyserRef,
+		error,
+		clearError,
 	};
 }
 

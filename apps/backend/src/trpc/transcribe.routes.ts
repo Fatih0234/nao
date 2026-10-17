@@ -1,11 +1,15 @@
 import { TRPCError } from '@trpc/server';
 import { z } from 'zod/v4';
 
+import { supportsTranscription } from '../agents/transcribe.providers';
 import * as transcribeService from '../services/transcribe.service';
+import { llmProviderSchema } from '../types/llm';
 import { HandlerError } from '../utils/error';
 import { cloudBillingProjectProcedure, projectProtectedProcedure } from './trpc';
 
-const transcribeProviderSchema = z.enum(['openai']);
+const transcribeProviderSchema = llmProviderSchema.refine(supportsTranscription, {
+	message: 'Provider does not support transcription',
+});
 
 export const transcribeRoutes = {
 	transcribe: cloudBillingProjectProcedure
@@ -18,11 +22,10 @@ export const transcribeRoutes = {
 		)
 		.mutation(async ({ ctx, input }) => {
 			try {
-				const text = await transcribeService.transcribeAudio(ctx.project.id, input.audio, {
+				return await transcribeService.transcribeAudio(ctx.project.id, input.audio, {
 					provider: input.provider,
 					modelId: input.modelId,
 				});
-				return { text };
 			} catch (error) {
 				if (error instanceof HandlerError) {
 					throw error;
@@ -36,5 +39,14 @@ export const transcribeRoutes = {
 
 	getModels: projectProtectedProcedure.query(async ({ ctx }) => {
 		return transcribeService.listAvailableTranscribeModels(ctx.project.id);
+	}),
+
+	getTarget: projectProtectedProcedure.query(async ({ ctx }) => {
+		const target = await transcribeService.resolveTranscribeTarget(ctx.project.id);
+		return {
+			provider: target.provider,
+			modelId: target.ok ? target.modelId : null,
+			error: target.ok ? null : target.error,
+		};
 	}),
 };

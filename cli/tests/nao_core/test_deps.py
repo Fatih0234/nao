@@ -1,6 +1,7 @@
 import pytest
 
 from nao_core.config import NaoConfig
+from nao_core.config.llm import LLMConfig, LLMProvider, ProviderConfig
 from nao_core.config.semantic_layer import SemanticLayerConfig
 from nao_core.deps import MissingDependencyError, get_required_extras, require_database_backend, require_dependency
 
@@ -45,3 +46,12 @@ def test_semantic_layer_config_requires_semantic_layer_extra():
 
     assert "semantic-layer" in get_required_extras(config)
     assert "semantic-layer" not in get_required_extras(NaoConfig(project_name="p"))
+
+
+def test_groq_provider_requires_openai_extra():
+    config = NaoConfig(
+        project_name="p",
+        llm=LLMConfig(providers=[ProviderConfig(provider=LLMProvider.GROQ, api_key="sk-test")]),
+    )
+
+    assert get_required_extras(config) == ["openai"]
