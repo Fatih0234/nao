@@ -127,12 +127,26 @@ async function validateBoundarySource(url: string): Promise<number> {
 
 type TranscribeSettings = NonNullable<AgentSettings['transcribe']>;
 
-/** A saved model id belongs to its provider, so switching provider without a model id drops it. */
+/** Switching providers drops a saved model id unless one is supplied; audio settings are kept. */
 function mergeTranscribeSettings(
 	existing: TranscribeSettings | undefined,
-	input: TranscribeSettings | undefined,
+	input: (Omit<TranscribeSettings, 'temperature'> & { temperature?: number | null }) | undefined,
 ): TranscribeSettings {
-	const merged = { ...existing, ...input };
+	const { temperature, ...updates } = input ?? {};
+	const merged: TranscribeSettings = {
+		...existing,
+		...updates,
+		...(temperature != null && { temperature }),
+	};
+	if (input?.language === '') {
+		delete merged.language;
+	}
+	if (input?.prompt === '') {
+		delete merged.prompt;
+	}
+	if (input?.temperature === null) {
+		delete merged.temperature;
+	}
 	const providerChanged = input?.provider !== undefined && input.provider !== existing?.provider;
 	if (providerChanged && input.modelId === undefined) {
 		delete merged.modelId;
@@ -946,6 +960,15 @@ export const projectRoutes = {
 							.refine(supportsTranscription, { message: 'Provider does not support transcription' })
 							.optional(),
 						modelId: z.string().optional(),
+						language: z
+							.string()
+							.trim()
+							.refine((value) => value === '' || /^[a-z]{2}$/.test(value), {
+								message: 'Language must be a lowercase ISO-639-1 code or empty',
+							})
+							.optional(),
+						prompt: z.string().trim().max(1000).optional(),
+						temperature: z.number().min(0).max(1).nullable().optional(),
 					})
 					.optional(),
 				sql: z
