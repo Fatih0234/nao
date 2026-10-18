@@ -119,7 +119,7 @@ describe('useTranscribe', () => {
 
 	it('resets the error when a new recording starts', async () => {
 		mocks.mutate.mockRejectedValueOnce(new Error('No API key configured for OpenAI.'));
-		mocks.mutate.mockResolvedValue('hello');
+		mocks.mutate.mockResolvedValue({ text: 'hello' });
 
 		const onTranscribed = vi.fn();
 		const { result } = renderHook(() => useTranscribe({ onTranscribed }));
@@ -137,6 +137,24 @@ describe('useTranscribe', () => {
 			await result.current.toggle();
 		});
 		expect(result.current.error).toBeNull();
+	});
+
+	it('passes the transcribed text to onTranscribed', async () => {
+		mocks.mutate.mockResolvedValue({ text: 'hello' });
+
+		const onTranscribed = vi.fn();
+		const { result } = renderHook(() => useTranscribe({ onTranscribed }));
+
+		await act(async () => {
+			await result.current.toggle();
+		});
+		await act(async () => {
+			result.current.toggle();
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		});
+
+		await waitFor(() => expect(onTranscribed).toHaveBeenCalledWith('hello'));
+		expect(onTranscribed).toHaveBeenCalledTimes(1);
 	});
 
 	it('sets an error when getUserMedia rejects', async () => {

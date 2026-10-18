@@ -1,15 +1,16 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Loader2, Mic, X } from 'lucide-react';
+import { ChevronDown, Loader2, Mic, X } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
-
 import { isLlmProvider, providerLabel } from '@nao/shared/types';
 import type { LlmProvider } from '@nao/shared/types';
+
 import { Button } from '@/components/ui/button';
 import { FormError } from '@/components/ui/form-fields';
 import { Input } from '@/components/ui/input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { SettingsCard } from '@/components/ui/settings-card';
 import { Switch } from '@/components/ui/switch';
+import { Textarea } from '@/components/ui/textarea';
 import { trpc, trpcClient } from '@/main';
 
 const TEST_DURATION_MS = 5000;
@@ -75,11 +76,107 @@ export function SettingsTranscribe({ isAdmin }: SettingsTranscribeProps) {
 			(currentModelId !== '' && !providerModels.some((m) => m.id === currentModelId)));
 	const testModelId = isCustomModel ? modelDraft.trim() : currentModelId;
 
+	const savedLanguage = agentSettings.data?.transcribe?.language ?? '';
+	const savedPrompt = agentSettings.data?.transcribe?.prompt ?? '';
+	const savedTemperature: number | null = agentSettings.data?.transcribe?.temperature ?? null;
+
+	const [showAdvanced, setShowAdvanced] = useState(false);
+	const [languageDraft, setLanguageDraft] = useState('');
+	const [promptDraft, setPromptDraft] = useState('');
+	const [temperatureDraft, setTemperatureDraft] = useState('');
+	const [languageError, setLanguageError] = useState<string | null>(null);
+	const [temperatureError, setTemperatureError] = useState<string | null>(null);
+	const languageRef = useRef<HTMLInputElement>(null);
+	const promptRef = useRef<HTMLTextAreaElement>(null);
+	const temperatureRef = useRef<HTMLInputElement>(null);
+	const hasAutoOpenedRef = useRef(false);
+
+	useEffect(() => {
+		if (hasAutoOpenedRef.current || !agentSettings.data) {
+			return;
+		}
+		hasAutoOpenedRef.current = true;
+		if (savedLanguage || savedPrompt || savedTemperature != null) {
+			setShowAdvanced(true);
+		}
+	}, [agentSettings.data, savedLanguage, savedPrompt, savedTemperature]);
+
+	useEffect(() => {
+		if (document.activeElement !== languageRef.current) {
+			setLanguageDraft(savedLanguage);
+		}
+	}, [savedLanguage]);
+
+	useEffect(() => {
+		if (document.activeElement !== promptRef.current) {
+			setPromptDraft(savedPrompt);
+		}
+	}, [savedPrompt]);
+
+	useEffect(() => {
+		if (document.activeElement !== temperatureRef.current) {
+			setTemperatureDraft(savedTemperature != null ? String(savedTemperature) : '');
+		}
+	}, [savedTemperature]);
+
 	useEffect(() => {
 		setCustomMode(false);
 		setForceCatalog(false);
 		setModelDraft(savedModelId ?? '');
 	}, [savedModelId, currentProvider]);
+
+	const commitLanguage = () => {
+		const normalized = languageDraft.trim().toLowerCase();
+		if (normalized !== '' && !/^[a-z]{2}$/.test(normalized)) {
+			setLanguageError('Enter a two-letter ISO-639-1 code (e.g. en, tr, de).');
+			return;
+		}
+		setLanguageError(null);
+		if (normalized !== languageDraft) {
+			setLanguageDraft(normalized);
+		}
+		if (normalized === savedLanguage) {
+			return;
+		}
+		updateAgentSettings.mutate({ transcribe: { language: normalized } });
+	};
+
+	const commitPrompt = () => {
+		const prompt = promptDraft.trim();
+		if (prompt !== promptDraft) {
+			setPromptDraft(prompt);
+		}
+		if (prompt === savedPrompt) {
+			return;
+		}
+		updateAgentSettings.mutate({ transcribe: { prompt } });
+	};
+
+	const commitTemperature = () => {
+		const raw = temperatureDraft.trim();
+		if (raw === '') {
+			setTemperatureError(null);
+			if (savedTemperature == null) {
+				return;
+			}
+			updateAgentSettings.mutate({ transcribe: { temperature: null } });
+			return;
+		}
+		const temperature = Number(raw);
+		if (Number.isNaN(temperature) || temperature < 0 || temperature > 1) {
+			setTemperatureError('Enter a number between 0 and 1.');
+			return;
+		}
+		setTemperatureError(null);
+		const normalized = String(temperature);
+		if (normalized !== temperatureDraft) {
+			setTemperatureDraft(normalized);
+		}
+		if (savedTemperature != null && temperature === savedTemperature) {
+			return;
+		}
+		updateAgentSettings.mutate({ transcribe: { temperature } });
+	};
 
 	const commitCustomModel = () => {
 		const modelId = modelDraft.trim();
@@ -114,6 +211,7 @@ export function SettingsTranscribe({ isAdmin }: SettingsTranscribeProps) {
 
 	const isMutating = updateAgentSettings.isPending;
 	const isTesting = testState !== 'idle';
+	const advancedDisabled = !isAdmin || isMutating || isTesting || isTargetUnavailable || !currentProvider;
 
 	return (
 		<SettingsCard
@@ -260,6 +358,120 @@ export function SettingsTranscribe({ isAdmin }: SettingsTranscribeProps) {
 								)}
 							</div>
 
+							<div>
+								<button
+									type='button'
+									onClick={() => setShowAdvanced(!showAdvanced)}
+									className='flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors'
+								>
+									<ChevronDown
+										className={`size-3 transition-transform ${showAdvanced ? 'rotate-180' : ''}`}
+									/>
+									Advanced settings
+								</button>
+
+								{showAdvanced && (
+									<div className='mt-3 space-y-4'>
+										<div className='grid gap-2'>
+											<label className='text-sm font-medium text-foreground'>Language</label>
+											<Input
+												ref={languageRef}
+												value={languageDraft}
+												onChange={(e) => {
+													setLanguageDraft(e.target.value);
+													if (languageError) {
+														setLanguageError(null);
+													}
+												}}
+												onBlur={commitLanguage}
+												onKeyDown={(e) => {
+													if (e.key === 'Enter') {
+														e.preventDefault();
+														commitLanguage();
+													}
+												}}
+												placeholder='e.g. en, tr, de'
+												disabled={advancedDisabled}
+											/>
+											{languageError && (
+												<p role='alert' className='text-xs text-destructive'>
+													{languageError}
+												</p>
+											)}
+											<p className='text-xs text-muted-foreground'>
+												ISO-639-1 code of the spoken language. Improves accuracy and latency.
+												Leave empty for auto-detection. Applies to voice input everywhere,
+												including connected messengers.
+											</p>
+										</div>
+
+										<div className='grid gap-2'>
+											<div className='flex items-center justify-between'>
+												<label className='text-sm font-medium text-foreground'>Prompt</label>
+												<span className='text-xs text-muted-foreground'>
+													{promptDraft.length}/1000
+												</span>
+											</div>
+											<Textarea
+												ref={promptRef}
+												value={promptDraft}
+												onChange={(e) => {
+													setPromptDraft(e.target.value);
+												}}
+												onBlur={commitPrompt}
+												placeholder='e.g. revenue, jaffle_shop, dbt, stripe_invoice_id'
+												rows={2}
+												maxLength={1000}
+												disabled={advancedDisabled}
+											/>
+											<p className='text-xs text-muted-foreground'>
+												Guides spelling and style; list domain terms like table or metric names
+												so they transcribe correctly.
+											</p>
+										</div>
+
+										<div className='grid gap-2'>
+											<label className='text-sm font-medium text-foreground'>Temperature</label>
+											<Input
+												ref={temperatureRef}
+												type='text'
+												inputMode='decimal'
+												value={temperatureDraft}
+												onChange={(e) => {
+													setTemperatureDraft(e.target.value);
+													if (temperatureError) {
+														setTemperatureError(null);
+													}
+												}}
+												onBlur={commitTemperature}
+												onKeyDown={(e) => {
+													if (e.key === 'Enter') {
+														e.preventDefault();
+														commitTemperature();
+													}
+												}}
+												placeholder='Default (0)'
+												disabled={advancedDisabled}
+											/>
+											{temperatureError && (
+												<p role='alert' className='text-xs text-destructive'>
+													{temperatureError}
+												</p>
+											)}
+											<p className='text-xs text-muted-foreground'>
+												Sampling temperature from 0 to 1, leave empty for the provider default
+												(0). Higher values make transcription more creative on low-confidence
+												segments.
+											</p>
+										</div>
+
+										<p className='text-xs text-muted-foreground'>
+											These settings are kept when switching provider.
+										</p>
+									</div>
+								)}
+							</div>
+
 							{updateAgentSettings.error && <FormError error={updateAgentSettings.error.message} />}
 							{isEnabled && targetError && <FormError error={targetError} />}
 
@@ -313,6 +525,11 @@ export function SettingsTranscribe({ isAdmin }: SettingsTranscribeProps) {
 														</span>
 													)}
 												</p>
+												{testResult.language && (
+													<p className='mt-1 text-xs opacity-75'>
+														Detected language: {testResult.language}
+													</p>
+												)}
 											</>
 										) : (
 											<p className='flex items-center gap-1.5'>
@@ -340,7 +557,7 @@ export function SettingsTranscribe({ isAdmin }: SettingsTranscribeProps) {
 }
 
 type TestState = 'idle' | 'recording' | 'transcribing';
-type TestResult = { success: true; text: string } | { success: false; error: string };
+type TestResult = { success: true; text: string; language?: string } | { success: false; error: string };
 
 function useTranscribeTest(provider: string, modelId: string) {
 	const [testState, setTestState] = useState<TestState>('idle');
@@ -442,12 +659,12 @@ function useTranscribeTest(provider: string, modelId: string) {
 
 			try {
 				const base64 = await blobToBase64(blob);
-				const text = await trpcClient.transcribe.transcribe.mutate({
+				const { text, language } = await trpcClient.transcribe.transcribe.mutate({
 					audio: base64,
 					provider: provider as LlmProvider,
 					modelId,
 				});
-				setTestResult({ success: true, text: text?.trim() ?? '' });
+				setTestResult({ success: true, text: text?.trim() ?? '', language });
 			} catch (err) {
 				const message = err instanceof Error ? err.message : 'Transcription failed';
 				setTestResult({ success: false, error: message });

@@ -150,7 +150,7 @@ describe('transcribeAudio', () => {
 
 		const result = await transcribeAudio('project-id', 'aGk=');
 
-		expect(result).toBe('hello');
+		expect(result).toEqual({ text: 'hello', language: 'tr' });
 		expect(testState.transcribeCalls.at(-1)?.model?.modelId).toBe('whisper-large-v3-turbo');
 	});
 

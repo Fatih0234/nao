@@ -10,10 +10,12 @@ import {
 	supportsTranscription,
 } from '../agents/transcribe.providers';
 import * as projectQueries from '../queries/project.queries';
+import type { AgentSettings } from '../types/agent-settings';
 import type { ProviderSettings, TranscribeModelDef } from '../types/llm';
 import { getProjectModelSources, isProviderDisabled, resolveProviderSettings } from '../utils/llm';
 
 type TranscribeOverrides = { provider?: LlmProvider; modelId?: string };
+type TranscriptionSettings = Pick<NonNullable<AgentSettings['transcribe']>, 'language' | 'prompt' | 'temperature'>;
 
 export type TranscribeTarget =
 	| { ok: true; provider: LlmProvider; modelId: string; settings: ProviderSettings }
@@ -23,17 +25,38 @@ export async function transcribeAudio(
 	projectId: string,
 	audio: string,
 	overrides?: TranscribeOverrides,
-): Promise<string> {
-	const target = await resolveTranscribeTarget(projectId, overrides);
+): Promise<{ text: string; language: string | undefined }> {
+	const { target, transcribeSettings } = await resolveTranscribeTargetWithSettings(projectId, overrides);
 	if (!target.ok) {
 		throw new Error(target.error);
 	}
 
 	const model = createTranscribeModel(target.provider, target.settings, target.modelId);
 	const audioBuffer = Buffer.from(audio, 'base64');
+	const providerOptions = buildTranscribeProviderOptions(transcribeSettings);
 
-	const result = await transcribe({ model, audio: audioBuffer });
-	return result.text;
+	const result = await transcribe({ model, audio: audioBuffer, providerOptions });
+	const rawLanguage = (result.responses[0] as { body?: { language?: unknown } } | undefined)?.body?.language;
+	return {
+		text: result.text,
+		language:
+			typeof result.language === 'string'
+				? result.language
+				: typeof rawLanguage === 'string'
+					? rawLanguage
+					: undefined,
+	};
+}
+
+/** The openai key is always present: the SDK only requests verbose_json, which carries the language, when it is. */
+function buildTranscribeProviderOptions(settings: TranscriptionSettings | undefined) {
+	return {
+		openai: {
+			...(settings?.language && { language: settings.language }),
+			...(settings?.prompt && { prompt: settings.prompt }),
+			...(settings?.temperature != null && { temperature: settings.temperature }),
+		},
+	};
 }
 
 /** Resolve the provider and model used by transcription, or return the actionable reason it cannot run. */
@@ -41,18 +64,41 @@ export async function resolveTranscribeTarget(
 	projectId: string,
 	overrides?: TranscribeOverrides,
 ): Promise<TranscribeTarget> {
+	return (await resolveTranscribeTargetWithSettings(projectId, overrides)).target;
+}
+
+async function resolveTranscribeTargetWithSettings(
+	projectId: string,
+	overrides?: TranscribeOverrides,
+): Promise<{ target: TranscribeTarget; transcribeSettings: TranscriptionSettings | undefined }> {
 	const agentSettings = await projectQueries.getAgentSettings(projectId);
 	const transcribeSettings = agentSettings?.transcribe;
+	const transcriptionSettings = transcribeSettings
+		? {
+				language: transcribeSettings.language,
+				prompt: transcribeSettings.prompt,
+				temperature: transcribeSettings.temperature,
+			}
+		: undefined;
 
 	if (overrides?.provider) {
-		return resolveExplicitTarget(projectId, overrides.provider, overrides.modelId);
+		return {
+			target: await resolveExplicitTarget(projectId, overrides.provider, overrides.modelId),
+			transcribeSettings: transcriptionSettings,
+		};
 	}
 
 	if (transcribeSettings?.provider) {
-		return resolveSavedTarget(projectId, transcribeSettings.provider, transcribeSettings.modelId);
+		return {
+			target: await resolveSavedTarget(projectId, transcribeSettings.provider, transcribeSettings.modelId),
+			transcribeSettings: transcriptionSettings,
+		};
 	}
 
-	return resolveAutomaticTarget(projectId);
+	return {
+		target: await resolveAutomaticTarget(projectId),
+		transcribeSettings: transcriptionSettings,
+	};
 }
 
 async function resolveExplicitTarget(
